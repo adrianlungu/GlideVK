@@ -1,0 +1,19 @@
+[package]
+name = "glidevk-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Backend-agnostic core of GlideVK: Glide state machine, texture format conversion, LFB, and the state-hash -> Vulkan pipeline/shader cache."
+
+[features]
+# Default is dependency-free so the core builds/tests on any host without a
+# network fetch. Enable `vulkan` to pull in the ash-based backend.
+default = []
+vulkan = ["dep:ash"]
+
+[dependencies]
+# `loaded` = dynamic-load the Vulkan loader at runtime (vulkan-1.dll under Wine
+# -> winevulkan; libvulkan.so.1 natively). No link-time Vulkan dependency.
+ash = { version = "0.38", optional = true, default-features = false, features = ["loaded"] }

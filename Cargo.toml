@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/glidevk-core",
+    "crates/glide3x",
+    "crates/glide2x",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lutris/glidevk"
+authors = ["GlideVK contributors"]
+
+# Note: the glide3x PE DLL is built for a Windows target (see README).
+# `glidevk-core` is host-buildable so it can be developed and tested natively.
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

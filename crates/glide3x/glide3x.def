@@ -1,0 +1,97 @@
+; glide3x.dll export table.
+;
+; The authoritative, undecorated names 3dfx Glide 3.x games import. Glide3 games
+; import the plain, unmangled names (`grDrawTriangle`, not `_grDrawTriangle@12`),
+; which Rust emits directly via `#[export_name]`; this .def is a *tracking*
+; manifest of the shipped surface (glide3x has no build.rs feeding it to the
+; linker — cross-check the built DLL with `objdump -p`).
+;
+; Every entry below now has a body in src/lib.rs. Markers:
+;   [impl]      real behavior wired to glidevk-core / the Vulkan backend.
+;   [accepted]  accepted + validated but a no-op (state we don't yet act on,
+;               or future-milestone features — fog render, NCC, region LFB).
+; Cross-check signatures against g3ext.h / glide.h from the open 3dfx Glide SDK.
+LIBRARY glide3x
+EXPORTS
+    ; --- lifecycle -------------------------------------------------------
+    grGlideInit                 ; [impl]
+    grGlideShutdown             ; [impl]
+    grGlideGetVersion           ; [impl]
+    grGlideGetState             ; [impl]  snapshot render state
+    grGlideSetState             ; [impl]  restore render state
+    ; --- context / window ------------------------------------------------
+    grSstWinOpen                ; [impl]
+    grSstWinClose               ; [impl]
+    grSstSelect                 ; [accepted] single board
+    grSstOrigin                 ; [impl]  origin -> backend Y flip
+    grSstScreenWidth            ; [impl]
+    grSstScreenHeight           ; [impl]
+    ; --- frame -----------------------------------------------------------
+    grBufferSwap                ; [impl]
+    grBufferClear               ; [impl]
+    grRenderBuffer              ; [impl]
+    ; --- combine / blend -------------------------------------------------
+    grColorCombine              ; [impl]
+    grAlphaCombine              ; [impl]
+    grAlphaBlendFunction        ; [impl]
+    grConstantColorValue        ; [impl]
+    grColorMask                 ; [impl]
+    grAlphaTestFunction         ; [impl]
+    grAlphaTestReferenceValue   ; [impl]
+    ; --- depth / fog / chroma -------------------------------------------
+    grDepthBufferMode           ; [impl]
+    grDepthBufferFunction       ; [impl]
+    grDepthMask                 ; [impl]
+    grDepthBiasLevel            ; [accepted]
+    grFogMode                   ; [impl]  toggles fog pipeline key
+    grFogColorValue             ; [accepted] fog render is future work
+    grFogTable                  ; [accepted] fog render is future work
+    grChromakeyMode             ; [impl]
+    grChromakeyValue            ; [impl]
+    ; --- clipping / cull -------------------------------------------------
+    grClipWindow                ; [accepted]
+    grCullMode                  ; [accepted]
+    grCoordinateSpace           ; [accepted]
+    ; --- drawing ---------------------------------------------------------
+    grDrawTriangle              ; [impl]
+    grDrawVertexArray           ; [impl]
+    grDrawVertexArrayContiguous ; [impl]
+    grDrawPoint                 ; [accepted]
+    grDrawLine                  ; [accepted]
+    grVertexLayout              ; [impl]
+    ; --- texture ---------------------------------------------------------
+    grTexSource                 ; [impl]
+    grTexDownloadMipMap         ; [impl]
+    grTexDownloadMipMapLevel    ; [impl]  base level only (no mipmap)
+    grTexDownloadTable          ; [impl]  P8 palette
+    grTexCombine                ; [impl]
+    grTexClampMode              ; [impl]  wrap/clamp sampler select
+    grTexFilterMode             ; [accepted] fixed linear sampler
+    grTexMipMapMode             ; [accepted] no mipmap
+    grTexLodBiasValue           ; [accepted]
+    grTexMinAddress             ; [impl]
+    grTexMaxAddress             ; [impl]
+    grTexTextureMemRequired     ; [impl]
+    grTexCalcMemRequired        ; [impl]
+    grTexNCCTable               ; [accepted] NCC is P4 fidelity work
+    ; --- linear frame buffer --------------------------------------------
+    grLfbLock                   ; [impl]  full-frame write path
+    grLfbUnlock                 ; [impl]
+    grLfbWriteRegion            ; [accepted] region LFB is future P3b work
+    grLfbReadRegion             ; [accepted] region LFB is future P3b work
+    ; --- query / misc ----------------------------------------------------
+    grGet                       ; [impl]  capability query
+    grReset                     ; [accepted]
+    grEnable                    ; [accepted]
+    grDisable                   ; [accepted]
+    grErrorSetCallback          ; [accepted]
+    grFinish                    ; [accepted]
+    grFlush                     ; [accepted]
+    grDitherMode                ; [accepted]
+    grLoadGammaTable            ; [accepted]
+    ; --- glide utility (gu*) --------------------------------------------
+    guFogGenerateExp            ; [impl]  fills caller fog table
+    guFogGenerateExp2           ; [impl]
+    guFogGenerateLinear         ; [impl]
+    guFogTableIndexToW          ; [impl]
+    guGammaCorrectionRGB        ; [accepted]

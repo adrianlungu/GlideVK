@@ -1,0 +1,17 @@
+[package]
+name = "glide3x"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GlideVK glide3x DLL shell: the 3dfx Glide 3.x entry points, translating to glidevk-core."
+
+[lib]
+# `cdylib` produces glide3x.dll under Wine (i686/x86_64-pc-windows-gnu) and a
+# libglide3.so natively. `name` sets the base output name.
+name = "glide3x"
+crate-type = ["cdylib"]
+
+[dependencies]
+glidevk-core = { path = "../glidevk-core", features = ["vulkan"] }

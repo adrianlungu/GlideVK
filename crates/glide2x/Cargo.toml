@@ -1,0 +1,16 @@
+[package]
+name = "glide2x"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "GlideVK glide2x DLL shell: the 3dfx Glide 2.x entry points, translating to glidevk-core."
+
+[lib]
+# Produces glide2x.dll under Wine and libglide2.so natively.
+name = "glide2x"
+crate-type = ["cdylib"]
+
+[dependencies]
+glidevk-core = { path = "../glidevk-core", features = ["vulkan"] }
