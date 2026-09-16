@@ -299,7 +299,9 @@ pub struct Backend {
     sampler_clamp: vk::Sampler,
     desc_set_layout: vk::DescriptorSetLayout,
     desc_pool: vk::DescriptorPool,
-    textures: HashMap<u32, GpuTexture>,
+    /// Keyed by TMU address for plain textures, or `texture::variant_key` for
+    /// palettised ones (one GPU copy per palette content).
+    textures: HashMap<u64, GpuTexture>,
     /// Textures replaced this frame (by a re-upload). They can still be
     /// referenced by draws already recorded into the current command buffer, so
     /// destroying them immediately faults the GPU — hold them until the frame's
@@ -360,6 +362,11 @@ pub struct Backend {
     capture_frame: i32,
     frame_num: u32,
     last_capture: Option<(u32, u32, u32, Vec<u8>)>, // (frame, w, h, rgba)
+    /// Copy every presented frame to the host (for `grLfbReadRegion` / read
+    /// locks). Off until a game asks to read the framebuffer.
+    full_readback: bool,
+    /// The most recent presented frame as RGBA8, when `full_readback` is on.
+    last_frame: Option<(u32, u32, Vec<u8>)>, // (w, h, rgba)
 
     swapchain: Option<Swapchain>,
 
@@ -659,6 +666,8 @@ impl Backend {
             capture_frame: -1,
             frame_num: 0,
             last_capture: None,
+            full_readback: false,
+            last_frame: None,
             swapchain,
             pending_clear: [0.0, 0.0, 0.0, 1.0],
             y_sign: 1.0,
@@ -693,6 +702,12 @@ impl Backend {
     /// `grSstScreenWidth/Height` should report so its UI layout matches.
     pub fn logical_size(&self) -> (u32, u32) {
         (self.logical_size[0] as u32, self.logical_size[1] as u32)
+    }
+
+    /// Change the game's coordinate space without touching the swapchain — for
+    /// a `grSstWinOpen` re-open at a different resolution on a live backend.
+    pub fn set_logical_size(&mut self, width: u32, height: u32) {
+        self.logical_size = [width.max(1) as f32, height.max(1) as f32];
     }
 
     /// Dimensions (px) of the currently-bound texture, exactly as fed to the
@@ -831,7 +846,7 @@ impl Backend {
     /// any previous texture at that address.
     pub fn upload_texture(
         &mut self,
-        addr: u32,
+        addr: u64,
         width: u32,
         height: u32,
         rgba: &[u8],
@@ -865,7 +880,14 @@ impl Backend {
 
     /// Select the texture at `addr` for subsequent draws (`grTexSource`).
     /// Returns `false` (and binds the 1x1 white default) for an unknown address.
-    pub fn set_texture(&mut self, addr: u32) -> bool {
+    /// Drop the texture under `key` once the current frame no longer needs it.
+    pub fn release_texture(&mut self, key: u64) {
+        if let Some(old) = self.textures.remove(&key) {
+            self.retired_textures.push(old);
+        }
+    }
+
+    pub fn set_texture(&mut self, addr: u64) -> bool {
         match self.textures.get(&addr) {
             Some(t) => {
                 self.current_desc = t.descriptor;
@@ -1203,7 +1225,8 @@ impl Backend {
                 || (self.capture_frame < 0
                     && self.frame_num > 0
                     && self.frame_num.is_multiple_of(-self.capture_frame as u32));
-            if capturing {
+            let copy_full = capturing || self.full_readback;
+            if copy_full {
                 let full = vk::BufferImageCopy {
                     buffer_offset: 0,
                     buffer_row_length: 0,
@@ -1291,7 +1314,7 @@ impl Backend {
             let px = std::slice::from_raw_parts(self.readback_mapped, 4);
             self.last_center_pixel = [px[2], px[1], px[0], px[3]];
 
-            if capturing {
+            if copy_full {
                 let (w, h) = (extent.width as usize, extent.height as usize);
                 let src = std::slice::from_raw_parts(self.capture_mapped, w * h * 4);
                 let mut rgba = vec![0u8; w * h * 4];
@@ -1302,7 +1325,11 @@ impl Backend {
                     rgba[i * 4 + 2] = src[i * 4];
                     rgba[i * 4 + 3] = 255;
                 }
-                self.last_capture = Some((self.frame_num, extent.width, extent.height, rgba));
+                if capturing {
+                    self.last_capture =
+                        Some((self.frame_num, extent.width, extent.height, rgba.clone()));
+                }
+                self.last_frame = Some((extent.width, extent.height, rgba));
             }
         }
         self.frame_num += 1;
@@ -1317,6 +1344,20 @@ impl Backend {
     /// Take the last captured frame (frame index, width, height, RGBA8), if any.
     pub fn take_capture(&mut self) -> Option<(u32, u32, u32, Vec<u8>)> {
         self.last_capture.take()
+    }
+
+    /// Keep a host copy of every presented frame so [`Backend::last_frame`]
+    /// can serve framebuffer reads (`grLfbReadRegion`, read locks).
+    pub fn set_full_readback(&mut self, on: bool) {
+        self.full_readback = on;
+    }
+
+    /// The most recently presented frame (width, height, RGBA8), available once
+    /// full readback is on and a frame has been presented since.
+    pub fn last_frame(&self) -> Option<(u32, u32, &[u8])> {
+        self.last_frame
+            .as_ref()
+            .map(|(w, h, px)| (*w, *h, px.as_slice()))
     }
 
     /// Begin a frame's render pass if one is not already in progress: wait for

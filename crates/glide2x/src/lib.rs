@@ -30,17 +30,25 @@ static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0
 /// on the game's working directory. A no-op when unset.
 fn glidevk_log(msg: &str) {
     use std::io::Write;
+    use std::sync::OnceLock;
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
     let path = match std::env::var("GLIDEVK_LOG") {
         Ok(v) if v == "1" || v.is_empty() => "glidevk.log".to_string(), // game's cwd
         Ok(v) => v,                                                     // explicit path
         Err(_) => return,
     };
+    // Prefix with seconds since the first log line so lifecycle events
+    // (re-opens, captures) can be placed against the game's own timeline.
+    let t = T0
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f32();
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     {
-        let _ = writeln!(f, "{msg}");
+        let _ = writeln!(f, "[{t:8.3}] {msg}");
     }
 }
 
@@ -56,6 +64,27 @@ fn log_once(flag: &AtomicBool, msg: &str) {
 
 /// Log `msg` the first time this exact `key` is seen — for enumerating all the
 /// distinct render-state configurations a game uses without per-call spam.
+/// `GLIDEVK_TRACE_FRAMES=<n>`: log every call to the traced entry points for
+/// the first `n` frames, in order, so call sequencing (texture download vs
+/// palette vs bind vs draw) can be read directly.
+fn trace_on() -> bool {
+    use std::sync::OnceLock;
+    static LIMIT: OnceLock<u32> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("GLIDEVK_TRACE_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    limit > 0 && FRAME.load(Ordering::Relaxed) < limit
+}
+
+fn trace(msg: &str) {
+    if trace_on() {
+        glidevk_log(&format!("trace f{} {msg}", FRAME.load(Ordering::Relaxed)));
+    }
+}
+
 fn log_distinct(key: u64, msg: &str) {
     use std::collections::HashSet;
     static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
@@ -76,6 +105,9 @@ static LAST_TEX_ADDR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 /// Distinct textured primitives logged so far by [`log_texcoords`], bounded by
 /// `TEXLOG_MAX` so an animating overlay can't flood the log.
 static TEXLOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Glide's texture-coordinate range on a texture's major axis (mirrors the
+/// shader's `GLIDE_ST_RANGE`).
+const GLIDE_ST_RANGE: f32 = 256.0;
 const TEXLOG_MAX: u32 = 1500;
 
 /// When `GLIDEVK_LOG` is set, log each *distinct* textured primitive once: the
@@ -144,12 +176,17 @@ fn log_texcoords(tris: &[DrawVertex], tex_size: [f32; 2], shade: &str) {
         "texdraw frame={frame} addr={addr:#x} texSize={tw}x{th} nverts={} {shade}",
         tris.len()
     );
-    // Show the primitive's first three vertices, reproducing the shader's divide:
-    // texel = sow/oow, uv = texel/texSize.
+    // Show the primitive's first three vertices, reproducing the shader's
+    // mapping: st = sow/oow in Glide's [0,256) space (major axis), then
+    // uv = st * major / (256 * texSize).
     for (i, v) in tris.iter().take(3).enumerate() {
         let w = if v.oow != 0.0 { v.oow } else { 1.0 };
         let (s, t) = (v.tex[0] / w, v.tex[1] / w);
-        let (u, vcoord) = (s / tw.max(1.0), t / th.max(1.0));
+        let major = tw.max(th).max(1.0);
+        let (u, vcoord) = (
+            s * major / (GLIDE_ST_RANGE * tw.max(1.0)),
+            t * major / (GLIDE_ST_RANGE * th.max(1.0)),
+        );
         msg.push_str(&format!(
             "\n  v{i} pos=({:.1},{:.1}) sow={:.3} tow={:.3} oow={:.6e} -> texel=({:.2},{:.2}) uv=({:.4},{:.4})",
             v.pos[0], v.pos[1], v.tex[0], v.tex[1], v.oow, s, t, u, vcoord
@@ -159,7 +196,7 @@ fn log_texcoords(tris: &[DrawVertex], tex_size: [f32; 2], shade: &str) {
 }
 
 static RAWLOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-const RAWLOG_MAX: u32 = 96;
+const RAWLOG_MAX: u32 = 400;
 
 /// Dump the *raw* `GrVertex` fields (before `read_vertex` normalizes anything)
 /// for the first vertex of a primitive, deduped + capped. This is the ground
@@ -180,6 +217,23 @@ unsafe fn log_raw_vertex(base: *const u8, nverts: i32) {
     let f = |off: usize| f32_at(base, off);
     let (x, y) = (f(V_X), f(V_Y));
     let addr = LAST_TEX_ADDR.load(Ordering::Relaxed);
+    // Cap per bound texture so one busy texture cannot exhaust the budget
+    // before the next one (e.g. a mesh skin) ever shows up.
+    static PER_ADDR: Mutex<Option<std::collections::HashMap<u32, u32>>> = Mutex::new(None);
+    const PER_ADDR_MAX: u32 = 4;
+    match PER_ADDR.lock() {
+        Ok(mut g) => {
+            let n = g
+                .get_or_insert_with(std::collections::HashMap::new)
+                .entry(addr)
+                .or_insert(0);
+            if *n >= PER_ADDR_MAX {
+                return;
+            }
+            *n += 1;
+        }
+        Err(_) => return,
+    }
     let mut h = std::collections::hash_map::DefaultHasher::new();
     addr.hash(&mut h);
     ((x * 16.0) as i64).hash(&mut h);
@@ -338,39 +392,71 @@ unsafe fn read_vertex(base: *const u8) -> DrawVertex {
     }
 }
 
-/// Texture address mode for a draw: CLAMP for affine 2D overlays, WRAP for
-/// perspective geometry.
-///
-/// Deus Ex sets `grTexClampMode` to WRAP globally, but our texture coordinates
-/// for its flat 2D-overlay geometry (logo/title bitmaps, the glow) come out far
-/// outside [0,1] — an affine-ST coordinate bug. WRAP-tiling those produces
-/// tile-seam artifacts (the intro logos rendered as grids of dark dots), so we
-/// clamp them to show the single image each intends.
-///
-/// The distinguisher is perspective: a flat overlay is affine — its `oow` (1/w)
-/// is constant across the primitive — whereas a perspective 3D surface (a
-/// projected intro backdrop, or gameplay walls that legitimately tile) has `oow`
-/// varying corner to corner. Clamping only the affine ones fixes the flat logos
-/// without blacking out perspective surfaces (which need WRAP to show their
-/// tiled/projected texture).
-///
-/// TODO: still a workaround — the real fix is recovering correct affine ST so
-/// coords land in [0,1] and honoring `grTexClampMode` directly.
-fn wants_clamp(verts: &[DrawVertex]) -> bool {
-    let (mut mn, mut mx) = (f32::MAX, f32::MIN);
-    for v in verts {
-        mn = mn.min(v.oow);
-        mx = mx.max(v.oow);
+/// Bind the texture selected by `grTexSource` for a draw. Palettised textures
+/// are decoded against the palette live *now* (Glide's TMU applies its LUT at
+/// draw time), cached per palette content so alternating palettes don't churn.
+fn bind_draw_texture(
+    textures: &mut glidevk_core::texture::TextureCache,
+    backend: &mut glidevk_core::vk::Backend,
+) {
+    let addr = LAST_TEX_ADDR.load(Ordering::Relaxed);
+    let Some(resolved) = textures.p8_draw(addr) else {
+        return; // plain texture: bound at grTexSource
+    };
+    for key in resolved.release {
+        backend.release_texture(key);
     }
-    // Affine when 1/w barely varies across the primitive.
-    (mx - mn) < 0.0005
+    if let Some(tex) = resolved.upload {
+        let n = (tex.rgba.len() / 4).max(1) as u64;
+        let avg = |c: usize| tex.rgba.chunks_exact(4).map(|p| p[c] as u64).sum::<u64>() / n;
+        log_distinct(
+            8 << 40 | (addr as u64) << 8 | avg(0),
+            &format!(
+                "p8 variant frame={} addr={addr:#x} palette={} {}x{} avgRGB=({},{},{})",
+                FRAME.load(Ordering::Relaxed),
+                textures.palette_id(),
+                tex.width,
+                tex.height,
+                avg(0),
+                avg(1),
+                avg(2)
+            ),
+        );
+        if let Ok(dir) = std::env::var("GLIDEVK_TEXDUMP") {
+            write_ppm(
+                &format!(
+                    "{dir}/p8_{addr:#07x}_pal{}_{}x{}.ppm",
+                    textures.palette_id(),
+                    tex.width,
+                    tex.height
+                ),
+                tex.width,
+                tex.height,
+                &tex.rgba,
+            );
+        }
+        let _ = backend.upload_texture(resolved.key, tex.width, tex.height, &tex.rgba);
+    }
+    backend.set_texture(resolved.key);
 }
 
 fn submit_fan(verts: &[DrawVertex]) {
     if verts.len() < 3 {
         return;
     }
-    let clamp = wants_clamp(verts);
+    if trace_on() {
+        let v = &verts[0];
+        trace(&format!(
+            "draw n={} tex={:#x} v0=({:.0},{:.0}) rgb=({:.0},{:.0},{:.0})",
+            verts.len(),
+            LAST_TEX_ADDR.load(Ordering::Relaxed),
+            v.pos[0],
+            v.pos[1],
+            v.color[0] * 255.0,
+            v.color[1] * 255.0,
+            v.color[2] * 255.0
+        ));
+    }
     let mut tris = Vec::with_capacity((verts.len() - 2) * 3);
     for i in 1..verts.len() - 1 {
         tris.extend_from_slice(&[verts[0], verts[i], verts[i + 1]]);
@@ -392,12 +478,13 @@ fn submit_fan(verts: &[DrawVertex]) {
             shade = shade_desc(&ctx.state);
         }
         if let Some(b) = ctx.backend.as_mut() {
+            bind_draw_texture(&mut ctx.textures, b);
             b.set_combine(combine);
             b.set_blend(blend);
             b.set_depth(depth);
             b.set_chroma(chroma_enable, chroma);
             b.set_alpha_test(atf, atr);
-            b.set_clamp(clamp);
+            b.set_clamp(ctx.state.tex_clamp);
             let _ = b.draw_triangles(&tris);
             tex_size = b.current_tex_size();
         }
@@ -485,8 +572,15 @@ pub extern "system" fn grSstWinOpen(
     // on the next present when the window size changed.
     if let Some(existing) = guard.as_mut() {
         if let Some(b) = existing.backend.as_mut() {
+            let (w, h) = resolution_to_size(screen_resolution);
             b.set_origin_upper_left(origin_location == 0);
-            glidevk_log("grSstWinOpen: reusing persistent backend (re-open)");
+            // The re-open may ask for a different mode (Unreal re-inits at the
+            // windowed size after a focus loss); the coordinate space and what
+            // grSstScreenWidth/Height report must follow it.
+            b.set_logical_size(w, h);
+            glidevk_log(&format!(
+                "grSstWinOpen: reusing persistent backend (re-open) hwnd={hwnd:#x} res={screen_resolution} -> {w}x{h}"
+            ));
             return 1;
         }
     }
@@ -555,21 +649,6 @@ extern "system" {
     fn GetModuleHandleW(module_name: *const u16) -> isize;
 }
 
-#[cfg(windows)]
-fn resolution_to_size(res: u32) -> (u32, u32) {
-    match res {
-        0 => (320, 200),
-        1 => (320, 240),
-        3 => (512, 384),
-        4 => (640, 400),
-        5 => (640, 480),
-        6 => (800, 600),
-        7 => (960, 720),
-        8 => (1024, 768),
-        _ => (640, 480),
-    }
-}
-
 #[export_name = "grSstWinClose"]
 pub extern "system" fn grSstWinClose() {
     glidevk_log("grSstWinClose");
@@ -602,6 +681,7 @@ pub extern "system" fn grSstScreenHeight() -> u32 {
 
 #[export_name = "grBufferClear"]
 pub extern "system" fn grBufferClear(color: u32, _alpha: u8, _depth: u32) {
+    trace(&format!("grBufferClear {color:#010x}"));
     let c = unpack_color(color);
     with_ctx(|ctx| {
         ctx.clear_color = c;
@@ -613,6 +693,7 @@ pub extern "system" fn grBufferClear(color: u32, _alpha: u8, _depth: u32) {
 
 #[export_name = "grBufferSwap"]
 pub extern "system" fn grBufferSwap(_swap_interval: i32) {
+    trace("grBufferSwap");
     FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let capture = with_ctx(|ctx| {
         if let Some(b) = ctx.backend.as_mut() {
@@ -707,10 +788,10 @@ pub extern "system" fn grAlphaBlendFunction(rs: i32, rd: i32, as_: i32, ad: i32)
         &format!("grAlphaBlendFunction rgb src={rs} dst={rd}"),
     );
     with_ctx(|ctx| {
-        ctx.state.blend_src_rgb = map_blend_factor(rs, true);
-        ctx.state.blend_dst_rgb = map_blend_factor(rd, false);
-        ctx.state.blend_src_alpha = map_blend_factor(as_, true);
-        ctx.state.blend_dst_alpha = map_blend_factor(ad, false);
+        ctx.state.blend_src_rgb = BlendFactor::from_glide(rs, true);
+        ctx.state.blend_dst_rgb = BlendFactor::from_glide(rd, false);
+        ctx.state.blend_src_alpha = BlendFactor::from_glide(as_, true);
+        ctx.state.blend_dst_alpha = BlendFactor::from_glide(ad, false);
     });
 }
 
@@ -960,9 +1041,18 @@ pub unsafe extern "system" fn grTexDownloadMipMapLevelPartial(
     format: u32,
     even_odd: u32,
     data: *const core::ffi::c_void,
-    _start_row: i32,
-    _end_row: i32,
+    start_row: i32,
+    end_row: i32,
 ) {
+    // Unreal uploads lightmaps this way with rows [0, VClamp-1] only. We still
+    // decode the full level (the source buffer is level-sized); log the range so
+    // a partial-row mismatch can be recognised.
+    log_distinct(
+        7 << 40 | (large_lod as u64) << 32 | (aspect as u64) << 24 | (start_row as u64) << 12 | (end_row as u64 & 0xfff),
+        &format!(
+            "grTexDownloadMipMapLevelPartial lod={lod} largeLod={large_lod} aspect={aspect} fmt={format:#x} rows={start_row}..{end_row}"
+        ),
+    );
     grTexDownloadMipMapLevel(
         tmu,
         start_address,
@@ -980,6 +1070,10 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
         return;
     }
     let info = &*info;
+    trace(&format!(
+        "grTexDownload addr={start_address:#x} fmt={:#x} lod={} aspect={}",
+        info.format, info.large_lod, info.aspect_ratio
+    ));
     if info.data.is_null() {
         return;
     }
@@ -999,11 +1093,20 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
         (w as usize) * (h as usize) * texfmt_bpp(fmt),
     );
     with_ctx(|ctx| {
-        // P8 textures are re-decoded when the palette animates, so keep their
-        // raw index data around.
+        // Palettised textures keep only their indices here: Glide applies the
+        // palette at draw time (Unreal binds, THEN uploads the texture's palette,
+        // then draws), so they are decoded per draw against the live palette —
+        // see `bind_draw_texture`. Any GPU variants of a previous texture at this
+        // address are stale.
         if matches!(fmt, TexFormat::P8) {
-            ctx.textures
+            let stale = ctx
+                .textures
                 .store_p8_source(start_address, w, h, src.to_vec());
+            if let Some(b) = ctx.backend.as_mut() {
+                for key in stale {
+                    b.release_texture(key);
+                }
+            }
         }
         match ctx.textures.decode(fmt, w, h, src) {
             Ok(tex) => {
@@ -1011,9 +1114,11 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
                 // dims, and average RGBA + alpha coverage. Tells us whether a
                 // garbled overlay (e.g. the green-dot backdrop at some addr) comes
                 // from the texture itself being green/masked vs. the combine.
-                log_texture_content(start_address, info.format, w, h, &tex.rgba);
-                if let Some(b) = ctx.backend.as_mut() {
-                    let _ = b.upload_texture(start_address, w, h, &tex.rgba);
+                log_texture_content(start_address, info.format, w, h, &tex.rgba, src);
+                if !matches!(fmt, TexFormat::P8) {
+                    if let Some(b) = ctx.backend.as_mut() {
+                        let _ = b.upload_texture(start_address as u64, w, h, &tex.rgba);
+                    }
                 }
             }
             Err(e) => glidevk_log(&format!(
@@ -1026,19 +1131,50 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
 
 /// Log a decoded texture's average colour + alpha coverage (deduped by address),
 /// so we can tell what a mis-rendered quad's texture actually contains.
-fn log_texture_content(addr: u32, format: u32, w: u32, h: u32, rgba: &[u8]) {
+fn log_texture_content(addr: u32, format: u32, w: u32, h: u32, rgba: &[u8], raw: &[u8]) {
     use std::collections::HashSet;
-    static SEEN: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+    use std::hash::{Hash, Hasher};
+    static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+    static DUMPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    const DUMP_MAX: u32 = 400;
     if std::env::var_os("GLIDEVK_LOG").is_none() || rgba.len() < 4 {
         return;
     }
+    // Unreal's texture cache reuses TMU addresses, so key on the content too
+    // (a coarse hash of the raw bytes), not just the address.
+    let mut hs = std::collections::hash_map::DefaultHasher::new();
+    (addr, format, w, h).hash(&mut hs);
+    raw.hash(&mut hs);
     let fresh = match SEEN.lock() {
-        Ok(mut g) => g.get_or_insert_with(HashSet::new).insert(addr),
+        Ok(mut g) => g.get_or_insert_with(HashSet::new).insert(hs.finish()),
         Err(_) => return,
     };
     if !fresh {
         return;
     }
+    let frame = FRAME.load(Ordering::Relaxed);
+    // GLIDEVK_TEXDUMP=<dir>: write each distinct decoded texture as a PPM so
+    // what the game uploaded can be inspected directly.
+    if let Ok(dir) = std::env::var("GLIDEVK_TEXDUMP") {
+        if DUMPED.fetch_add(1, Ordering::Relaxed) < DUMP_MAX {
+            write_ppm(
+                &format!("{dir}/tex_f{frame:05}_{addr:#07x}_{w}x{h}_fmt{format:x}.ppm"),
+                w,
+                h,
+                rgba,
+            );
+        }
+    }
+    // Palettised textures: show the index range so an all-black decode can be
+    // attributed to the indices vs the palette.
+    let idx = if format == 0x5 && !raw.is_empty() {
+        let (mn, mx) = raw
+            .iter()
+            .fold((255u8, 0u8), |(a, b), &v| (a.min(v), b.max(v)));
+        format!(" idx={mn}..{mx}")
+    } else {
+        String::new()
+    };
     let (mut r, mut gg, mut b, mut a, mut opaque) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let n = rgba.len() / 4;
     for px in rgba.chunks_exact(4) {
@@ -1052,7 +1188,7 @@ fn log_texture_content(addr: u32, format: u32, w: u32, h: u32, rgba: &[u8]) {
     }
     let d = n.max(1) as u64;
     glidevk_log(&format!(
-        "texcontent addr={addr:#x} fmt={format:#x} {w}x{h} avgRGBA=({},{},{},{}) opaque={}%",
+        "texcontent frame={frame} addr={addr:#x} fmt={format:#x} {w}x{h} avgRGBA=({},{},{},{}) opaque={}%{idx}",
         r / d,
         gg / d,
         b / d,
@@ -1069,18 +1205,14 @@ pub extern "system" fn grTexSource(
     _info: *const GrTexInfo,
 ) {
     LAST_TEX_ADDR.store(start_address, Ordering::Relaxed);
+    trace(&format!("grTexSource addr={start_address:#x}"));
     with_ctx(|ctx| {
-        // If this is a palettized texture and the palette has cycled since it was
-        // last uploaded, re-decode it against the live palette before binding
-        // (capped to once per texture per frame).
-        let frame = FRAME.load(std::sync::atomic::Ordering::Relaxed) as u64;
-        if let Some(tex) = ctx.textures.take_p8_redecode(start_address, frame) {
-            if let Some(b) = ctx.backend.as_mut() {
-                let _ = b.upload_texture(start_address, tex.width, tex.height, &tex.rgba);
-            }
+        // Palettised textures are resolved per draw (`bind_draw_texture`).
+        if ctx.textures.is_p8(start_address) {
+            return;
         }
         if let Some(b) = ctx.backend.as_mut() {
-            let found = b.set_texture(start_address);
+            let found = b.set_texture(start_address as u64);
             if !found {
                 log_once(
                     &LOG_TS,
@@ -1103,6 +1235,22 @@ pub unsafe extern "system" fn grTexDownloadTable(
     let src = std::slice::from_raw_parts(data as *const u32, 256);
     let mut palette = [0u32; 256];
     palette.copy_from_slice(src);
+    let nonzero = palette.iter().filter(|&&c| c & 0x00ff_ffff != 0).count();
+    trace(&format!(
+        "grTexDownloadTable nonzero={nonzero} p[1]={:#08x} p[29]={:#08x}",
+        palette[1] & 0xff_ffff,
+        palette[29] & 0xff_ffff
+    ));
+    log_distinct(
+        6 << 40 | (nonzero as u64) << 8 | (palette[1] & 0xff) as u64,
+        &format!(
+            "grTexDownloadTable type={_table_type} nonzero={nonzero}/256 p[0..8]={:06x?} p[16]={:#08x} p[29]={:#08x} p[255]={:#08x}",
+            palette[..8].iter().map(|c| c & 0xff_ffff).collect::<Vec<_>>(),
+            palette[16] & 0xff_ffff,
+            palette[29] & 0xff_ffff,
+            palette[255] & 0xff_ffff
+        ),
+    );
     // Deus Ex animates its intro logos by cycling this palette. Just record it
     // (a cheap version bump); the affected P8 textures re-decode lazily when
     // next bound for drawing, so the hundreds of redundant per-frame uploads
@@ -1158,7 +1306,6 @@ pub unsafe extern "system" fn grDrawTriangle(
         read_vertex(b as *const u8),
         read_vertex(c as *const u8),
     ];
-    let clamp = wants_clamp(&tris);
     let mut tex_size = [1.0, 1.0];
     let mut shade = String::new();
     with_ctx(|ctx| {
@@ -1176,12 +1323,13 @@ pub unsafe extern "system" fn grDrawTriangle(
             shade = shade_desc(&ctx.state);
         }
         if let Some(bk) = ctx.backend.as_mut() {
+            bind_draw_texture(&mut ctx.textures, bk);
             bk.set_combine(combine);
             bk.set_blend(blend);
             bk.set_depth(depth);
             bk.set_chroma(ce, ck);
             bk.set_alpha_test(atf, atr);
-            bk.set_clamp(clamp);
+            bk.set_clamp(ctx.state.tex_clamp);
             let _ = bk.draw_triangles(&tris);
             tex_size = bk.current_tex_size();
         }
@@ -1265,17 +1413,62 @@ pub extern "system" fn grLfbUnlock(_lock_type: u32, _buffer: u32) -> FxBool {
     1
 }
 
+/// `grLfbReadRegion`: copy a rectangle of the framebuffer to caller memory as
+/// 16-bit RGB565 (the only format Glide 2 reads back in).
+///
+/// Reads come from the **last presented frame**: the first call enables the
+/// per-frame host copy, so a read made before any frame has been presented
+/// with readback on returns zeros. Coordinates are in the game's logical space
+/// and scaled to the swapchain extent when the two differ.
+///
+/// # Safety
+/// `dst_data` must point to at least `src_h * dst_stride` writable bytes.
 #[export_name = "grLfbReadRegion"]
-pub extern "system" fn grLfbReadRegion(
+pub unsafe extern "system" fn grLfbReadRegion(
     _src_buffer: u32,
-    _src_x: u32,
-    _src_y: u32,
-    _src_w: u32,
-    _src_h: u32,
-    _dst_stride: u32,
-    _dst_data: *mut core::ffi::c_void,
+    src_x: u32,
+    src_y: u32,
+    src_w: u32,
+    src_h: u32,
+    dst_stride: u32,
+    dst_data: *mut core::ffi::c_void,
 ) -> FxBool {
-    1
+    if dst_data.is_null() || src_w == 0 || src_h == 0 {
+        return 0;
+    }
+    let dst_len = (src_h as usize) * (dst_stride as usize);
+    let dst = std::slice::from_raw_parts_mut(dst_data as *mut u8, dst_len);
+    with_ctx(|ctx| {
+        let Some(b) = ctx.backend.as_mut() else {
+            return 0;
+        };
+        b.set_full_readback(true);
+        let (lw, lh) = b.logical_size();
+        let Some((fw, fh, rgba)) = b.last_frame() else {
+            glidevk_log("grLfbReadRegion: no frame presented since readback enabled");
+            dst.fill(0);
+            return 1;
+        };
+        for row in 0..src_h {
+            let fy = ((src_y + row) * fh / lh.max(1)).min(fh - 1) as usize;
+            for col in 0..src_w {
+                let fx = ((src_x + col) * fw / lw.max(1)).min(fw - 1) as usize;
+                let i = (fy * fw as usize + fx) * 4;
+                let px = pack_rgb565(rgba[i], rgba[i + 1], rgba[i + 2]);
+                let o = (row * dst_stride + col * 2) as usize;
+                if o + 2 <= dst.len() {
+                    dst[o..o + 2].copy_from_slice(&px.to_le_bytes());
+                }
+            }
+        }
+        1
+    })
+    .unwrap_or(0)
+}
+
+/// Pack 8-bit RGB into the Glide framebuffer's RGB565.
+fn pack_rgb565(r: u8, g: u8, b: u8) -> u16 {
+    ((r as u16 >> 3) << 11) | ((g as u16 >> 2) << 5) | (b as u16 >> 3)
 }
 
 #[export_name = "grLfbWriteRegion"]
@@ -1353,42 +1546,6 @@ fn map_combine_other(v: i32) -> CombineOther {
     }
 }
 
-/// Canonical Glide `GrAlphaBlendFnc_t` (glide.h) → `BlendFactor`.
-///
-/// Glide's `_COLOR` codes name the *other* operand: on the source factor 0x2 is
-/// GR_BLEND_DST_COLOR and 0x4 is GR_BLEND_ONE_MINUS_DST_COLOR, while on the
-/// destination factor the same codes are the SRC colour. `is_src` selects the
-/// right side. (Getting this wrong is what made an earlier "canonical" attempt
-/// break Deus Ex's additive glow — its `src=4` is one-minus-*dst*-colour, not
-/// one-minus-src.) Verified against the wine_blend harness and Deus Ex.
-fn map_blend_factor(v: i32, is_src: bool) -> BlendFactor {
-    use BlendFactor::*;
-    match v {
-        0x0 => Zero,
-        0x1 => SrcAlpha,
-        0x2 => {
-            if is_src {
-                DstColor
-            } else {
-                SrcColor
-            }
-        }
-        0x3 => OneMinusSrcAlpha,
-        0x4 => {
-            if is_src {
-                OneMinusDstColor
-            } else {
-                OneMinusSrcColor
-            }
-        }
-        0x5 => DstAlpha,
-        0x6 => One,
-        0x7 => OneMinusDstAlpha,
-        0xf => AlphaSaturate,
-        _ => Zero,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Accepted-but-minimal entry points (state stored elsewhere or not yet used)
 // ---------------------------------------------------------------------------
@@ -1434,10 +1591,13 @@ pub extern "system" fn grGammaCorrectionValue(value: f32) {
     });
 }
 stub!("grHints", gr_hints(hint: i32, mask: u32));
-// `grTexClampMode(tmu, s_mode, t_mode)` — accepted but not yet honored; see
-// `wants_clamp` (we clamp all draws for now to avoid the 2D-overlay tile-seam
-// artifact that shows the intro logos as grids of dots).
-stub!("grTexClampMode", gr_tex_clamp(tmu: u32, s: i32, t: i32));
+/// `grTexClampMode(tmu, s_mode, t_mode)`: GR_TEXTURECLAMP_WRAP (0) / _CLAMP (1)
+/// (Glide 3 adds _MIRROR_EXTEND, mapped to clamp). Either axis non-wrap selects
+/// the clamped sampler for subsequent draws.
+#[export_name = "grTexClampMode"]
+pub extern "system" fn grTexClampMode(_tmu: u32, s_mode: i32, t_mode: i32) {
+    with_ctx(|ctx| ctx.state.tex_clamp = s_mode != 0 || t_mode != 0);
+}
 stub!("grTexCombine", gr_tex_combine(tmu: u32, rf: i32, rfa: i32, af: i32, afa: i32, ri: FxBool, ai: FxBool));
 stub!("grTexCombineFunction", gr_tex_combine_fn(tmu: u32, func: i32));
 stub!("grTexFilterMode", gr_tex_filter(tmu: u32, minf: i32, magf: i32));
@@ -1544,5 +1704,19 @@ mod tests {
             ..info
         };
         assert_eq!(tex_dims(&info8), (8, 8)); // GR_LOD_8 = 5
+    }
+}
+
+#[cfg(test)]
+mod lfb_tests {
+    use super::pack_rgb565;
+
+    #[test]
+    fn rgb565_packing_matches_glide_framebuffer_layout() {
+        assert_eq!(pack_rgb565(255, 0, 0), 0xF800);
+        assert_eq!(pack_rgb565(0, 255, 0), 0x07E0);
+        assert_eq!(pack_rgb565(0, 0, 255), 0x001F);
+        assert_eq!(pack_rgb565(255, 255, 255), 0xFFFF);
+        assert_eq!(pack_rgb565(0, 0, 0), 0x0000);
     }
 }

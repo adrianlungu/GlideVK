@@ -5,25 +5,17 @@ of [DXVK](https://github.com/doitsujin/dxvk) / [D7VK](https://github.com/WinterS
 drop-in `glide3x.dll` / `glide2x.dll` that translate Glide calls **directly** to
 Vulkan under Wine — no Direct3D or OpenGL hop.
 
-> Status: **P3a complete — raster-state correctness (blend + depth + tests).**
-> Textured combine rendering (P2) plus alpha blending, depth buffering, and
-> alpha-test/chroma-key discard — the pipeline cache now builds a distinct
-> `VkPipeline` per blend/depth state. Verified by center-pixel readback across
-> three sub-tests, all via `winevulkan` on RADV:
->
-> ```
-> # examples/wine_window.c
-> A blend    : center=0xFF00FFFF -> PASS   (additive red over blue = magenta)
-> B depth    : center=0x00FF00FF -> PASS   (near-first; depth test keeps green)
-> C alphatest: center=0x0000FFFF -> PASS   (zero-alpha discarded, stays blue)
-> PASS: blend + depth + alpha-test all correct (0 present errors)
-> ```
->
-> Verified on the **32-bit** ship target (`i686-pc-windows-gnu`) — where the
-> Glide games actually live — as well as 64-bit. Reproduce with
-> `examples/run_wine_probe.sh [32|64]`. Next: **P3b — fog + LFB** (the last
-> correctness pieces before a real game runs). See
-> [`docs/feasibility.md`](docs/feasibility.md).
+> Status: **P3 in progress — real games.** `glide2x.dll` + `glide3x.dll`
+> shells over a shared core. Deus Ex (Unreal, glide2x) boots and plays its
+> whole intro with GlideVK: the Eidos and Ion Storm logos, the flying title and
+> the lit metallic emblem all render (see
+> [`docs/game-compatibility.md`](docs/game-compatibility.md)). Behaviour is
+> checked **against a reference Glide DLL** (nGlide) with
+> `examples/run_diff.sh`, which found three root causes in a row: Glide's s/t
+> span `[0,256)` on the major axis, not texels; the blend-factor table was
+> permuted; and palettes apply at draw time, not bind time. The Wine smoke
+> tests (`examples/run_wine_probe.sh [32|64]`) still pass on the 32-bit ship
+> target.
 
 Origin: proposed in [lutris/dgvoodoo2#5](https://github.com/lutris/dgvoodoo2/issues/5)
 as the missing FOSS piece for legacy-API coverage on Linux, alongside D7VK,
@@ -55,6 +47,17 @@ cargo check -p glidevk-core --features vulkan   # type-check the ash backend
 
 The core builds on any host so the state machine, texture decode, and LFB
 packing can be developed and tested without a Vulkan loader.
+
+### Differential tests (against a reference Glide DLL)
+
+```sh
+examples/run_diff.sh                    # wine_texcoord beside nGlide and beside ours, diffed
+GLIDE2X_REF=/path/glide2x.dll examples/run_diff.sh wine_texcoord
+```
+
+Harnesses that read back through `grLfbReadRegion` run unchanged against any
+Glide 2 implementation, so the reference defines correct behaviour. See
+`docs/game-compatibility.md` § *Differential testing*.
 
 ### glide3x.dll (Wine target — the shipping artifact)
 

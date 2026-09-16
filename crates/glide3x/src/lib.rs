@@ -23,7 +23,6 @@
 //! [`glide3x.def`]: ../../../crates/glide3x/glide3x.def
 #![allow(non_snake_case, clippy::missing_safety_doc)]
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use glidevk_core::state::DepthMode;
@@ -162,23 +161,6 @@ extern "system" {
     fn GetModuleHandleW(module_name: *const u16) -> isize;
 }
 
-/// Map the common `GR_RESOLUTION_*` values to pixel dimensions. The surface's
-/// reported extent still wins at swapchain creation; this is the fallback.
-#[cfg(windows)]
-fn resolution_to_size(res: u32) -> (u32, u32) {
-    match res {
-        0 => (320, 200),
-        1 => (320, 240),
-        3 => (512, 384),
-        4 => (640, 400),
-        5 => (640, 480),
-        6 => (800, 600),
-        7 => (960, 720),
-        8 => (1024, 768),
-        _ => (640, 480),
-    }
-}
-
 #[export_name = "grSstWinClose"]
 pub extern "system" fn grSstWinClose(_context: GrContext) -> FxBool {
     if let Ok(mut g) = CONTEXT.lock() {
@@ -293,10 +275,10 @@ pub extern "system" fn grAlphaBlendFunction(
     alpha_dst: i32,
 ) {
     with_ctx(|ctx| {
-        ctx.state.blend_src_rgb = map_blend_factor(rgb_src);
-        ctx.state.blend_dst_rgb = map_blend_factor(rgb_dst);
-        ctx.state.blend_src_alpha = map_blend_factor(alpha_src);
-        ctx.state.blend_dst_alpha = map_blend_factor(alpha_dst);
+        ctx.state.blend_src_rgb = BlendFactor::from_glide(rgb_src, true);
+        ctx.state.blend_dst_rgb = BlendFactor::from_glide(rgb_dst, false);
+        ctx.state.blend_src_alpha = BlendFactor::from_glide(alpha_src, true);
+        ctx.state.blend_dst_alpha = BlendFactor::from_glide(alpha_dst, false);
     });
 }
 
@@ -507,13 +489,9 @@ fn to_triangle_list(mode: i32, v: &[DrawVertex]) -> Vec<DrawVertex> {
     out
 }
 
-/// Texture S/T address mode from `grTexClampMode`: true = CLAMP, false = WRAP
-/// (the Glide default). Applied per-draw via the backend's clamp/repeat sampler.
-static TEX_CLAMP: AtomicBool = AtomicBool::new(false);
-
 fn submit_triangles(tris: &[DrawVertex]) {
-    let clamp = TEX_CLAMP.load(Ordering::Relaxed);
     with_ctx(|ctx| {
+        let clamp = ctx.state.tex_clamp;
         let combine = CombineParams::from_state(&ctx.state);
         let blend = BlendConfig::from_state(&ctx.state);
         let depth = DepthConfig::from_state(&ctx.state);
@@ -706,7 +684,7 @@ unsafe fn download_texture(start_address: u32, info: &GrTexInfo) {
             Err(_) => return,
         };
         if let Some(backend) = ctx.backend.as_mut() {
-            let _ = backend.upload_texture(start_address, w, h, &decoded.rgba);
+            let _ = backend.upload_texture(start_address as u64, w, h, &decoded.rgba);
         }
     });
 }
@@ -720,7 +698,7 @@ pub extern "system" fn grTexSource(
 ) {
     with_ctx(|ctx| {
         if let Some(backend) = ctx.backend.as_mut() {
-            backend.set_texture(start_address);
+            backend.set_texture(start_address as u64);
         }
     });
 }
@@ -766,7 +744,7 @@ pub extern "system" fn grTexCombine(
 /// sampler (mirror is approximated as clamp for now).
 #[export_name = "grTexClampMode"]
 pub extern "system" fn grTexClampMode(_tmu: u32, s_mode: i32, t_mode: i32) {
-    TEX_CLAMP.store(s_mode != 0 || t_mode != 0, Ordering::Relaxed);
+    with_ctx(|ctx| ctx.state.tex_clamp = s_mode != 0 || t_mode != 0);
 }
 
 /// `grTexCalcMemRequired(smallLod, largeLod, aspect, format)` -> bytes needed in
@@ -1177,22 +1155,6 @@ fn map_combine_other(v: i32) -> CombineOther {
     }
 }
 
-fn map_blend_factor(v: i32) -> BlendFactor {
-    use BlendFactor::*;
-    match v {
-        0x0 => Zero,
-        0x1 => SrcAlpha,
-        0x2 => SrcColor,
-        0x3 => DstAlpha,
-        0x4 => One,
-        0x5 => OneMinusSrcAlpha,
-        0x6 => OneMinusSrcColor,
-        0x7 => OneMinusDstAlpha,
-        0xf => AlphaSaturate,
-        _ => Zero,
-    }
-}
-
 /// Declare a not-yet-implemented export that links and returns cleanly, so a
 /// game importing it does not fail to load. Fill these in per milestone.
 #[macro_export]
@@ -1249,10 +1211,12 @@ mod tests {
 
     #[test]
     fn tex_clamp_mode_toggles_flag() {
+        assert_eq!(grSstWinOpen(0, 0, -1, 0, 0, 2, 1), 1);
         grTexClampMode(0, 1, 0); // s = CLAMP
-        assert!(TEX_CLAMP.load(Ordering::Relaxed));
+        assert_eq!(with_ctx(|ctx| ctx.state.tex_clamp), Some(true));
         grTexClampMode(0, 0, 0); // both WRAP
-        assert!(!TEX_CLAMP.load(Ordering::Relaxed));
+        assert_eq!(with_ctx(|ctx| ctx.state.tex_clamp), Some(false));
+        grSstWinClose(1);
     }
 
     #[test]

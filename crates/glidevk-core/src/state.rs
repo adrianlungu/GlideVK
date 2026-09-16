@@ -76,6 +76,10 @@ pub struct State {
     /// framebuffer. Both default on.
     pub color_mask_rgb: bool,
     pub color_mask_alpha: bool,
+
+    /// `grTexClampMode`: true when either axis is CLAMP (or MIRROR, approximated
+    /// as clamp); false = WRAP, the Glide default.
+    pub tex_clamp: bool,
 }
 
 impl Default for State {
@@ -113,6 +117,7 @@ impl Default for State {
             alpha_it_lighting: false,
             color_mask_rgb: true,
             color_mask_alpha: true,
+            tex_clamp: false,
         }
     }
 }

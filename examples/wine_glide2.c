@@ -38,7 +38,7 @@ typedef void(__stdcall *tri_fn)(const void *, const void *, const void *);
 typedef int(__stdcall *result_fn)(void);
 typedef unsigned int(__stdcall *pixel_fn)(void);
 
-#define GR_RES_640x480 5
+#define GR_RES_640x480 7    /* GR_RESOLUTION_640x480 per glide.h (5 is 640x350) */
 #define GR_ORIGIN_UPPER_LEFT 0
 #define GR_TMU0 0
 #define GR_TEXFMT_RGB_565 0x0a

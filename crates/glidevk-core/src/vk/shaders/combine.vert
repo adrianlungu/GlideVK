@@ -34,7 +34,10 @@ void main() {
     float x = inPos.x / pc.viewport.x * 2.0 - 1.0;
     float y = (inPos.y / pc.viewport.y * 2.0 - 1.0) * pc.ySign;
     gl_Position = vec4(x, y, clamp(inDepth, 0.0, 1.0), 1.0);
-    vColor = inColor;
+    // Glide iterated colours are [0,255]; the hardware saturates. Games leave
+    // unused channels as garbage (Unreal's DrawComplexSurface passes e.g. 885
+    // and -497), which must not leak into combine/blend math.
+    vColor = clamp(inColor, 0.0, 1.0);
     // Pass sow/tow and oow through; the fragment shader divides for
     // perspective-correct, texture-size-normalized coordinates.
     vTex = inTex;

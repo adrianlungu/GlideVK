@@ -35,13 +35,21 @@ layout(push_constant) uniform Push {
     int wireframe;       // GLIDEVK_WIREFRAME: force a bright output colour
 } pc;
 
-// Recover the perspective-correct, normalized TMU0 coordinate: s = sow/oow,
-// then divide by the texture size. oow==0 (unset) falls back to affine.
+// Glide texture-coordinate space: s and t span [0, GLIDE_ST_RANGE) on the
+// texture's LARGER axis regardless of its pixel size, and [0, GLIDE_ST_RANGE /
+// aspect) on the smaller one (3dfx programming guide; verified against nGlide
+// by examples/wine_texcoord.c). So a 32x32 texture is covered by 0..256 on both
+// axes, a 64x16 one by 0..256 x 0..64.
+const float GLIDE_ST_RANGE = 256.0;
+
+// Recover the perspective-correct TMU0 coordinate (s = sow/oow) and map it from
+// Glide space to normalized UV. oow==0 (unset) falls back to affine.
 vec2 texCoord() {
     float w = (vOow != 0.0) ? vOow : 1.0;
     vec2 st = vTex / w;
     vec2 size = max(pc.texSize, vec2(1.0));
-    return st / size;
+    float major = max(size.x, size.y);
+    return st * major / (GLIDE_ST_RANGE * size);
 }
 
 // --- source selectors (GR_COMBINE_LOCAL_* / GR_COMBINE_OTHER_*) -------------

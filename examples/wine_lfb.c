@@ -27,7 +27,7 @@ typedef int(__stdcall *unlock_fn)(unsigned int, unsigned int);
 typedef int(__stdcall *result_fn)(void);
 typedef unsigned int(__stdcall *pixel_fn)(void);
 
-#define GR_RES_640x480 5
+#define GR_RES_640x480 7    /* GR_RESOLUTION_640x480 per glide.h (5 is 640x350) */
 #define GR_ORIGIN_UPPER_LEFT 0
 #define GR_LFB_WRITE_ONLY 1
 #define GR_BUFFER_BACKBUFFER 1

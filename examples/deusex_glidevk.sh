@@ -21,7 +21,14 @@ case "${1:-}" in
     [ -f "$SYS/glide2x.dll.glidevk-orig" ] || cp "$SYS/glide2x.dll" "$SYS/glide2x.dll.glidevk-orig"
     [ -f "$SYS/DeusEx.ini.glidevk-orig" ] || cp "$SYS/DeusEx.ini" "$SYS/DeusEx.ini.glidevk-orig"
     cp "$OURS" "$SYS/glide2x.dll"
-    sed -i 's/^GameRenderDevice=.*/GameRenderDevice=GlideDrv.GlideRenderDevice/; s/^WindowedRenderDevice=.*/WindowedRenderDevice=GlideDrv.GlideRenderDevice/' "$SYS/DeusEx.ini"
+    # Only the fullscreen device goes to Glide. WindowedRenderDevice must stay
+    # SoftDrv: Unreal's GlideDrv is fullscreen-only (its SetRes returns 0 for a
+    # windowed request), and on WM_KILLFOCUS the engine re-inits with the
+    # *windowed* device. Pointing that at GlideDrv is what produced the
+    # "3d hardware initialization failed" -> "Assertion failed: RenDev" crash on
+    # any focus loss, with real Glide drivers too. With SoftDrv the game drops to
+    # software while minimized and re-enters Glide fullscreen on restore.
+    sed -i 's/^GameRenderDevice=.*/GameRenderDevice=GlideDrv.GlideRenderDevice/; s/^WindowedRenderDevice=.*/WindowedRenderDevice=SoftDrv.SoftwareRenderDevice/' "$SYS/DeusEx.ini"
     # `install windowed` runs the game WINDOWED (StartupFullscreen=False). This is
     # the proper fix for the Unreal-1 alt-tab/focus-loss crash (an engine bug:
     # WM_KILLFOCUS -> EndFullscreen asserts a null RenDev) and, unlike a Wine

@@ -101,7 +101,18 @@ sequence). Getting there fixed a chain of real Glide-vs-Vulkan mismatches:
   the window, so 2D overlays center correctly. `grSstScreenWidth/Height` report
   it too.
 
-**Focus-loss crash (alt-tab / minimize) — was a GlideVK bug, now fixed.** On
+**Focus-loss crash (alt-tab / minimize) — two causes, both fixed.** The
+second, found later: `deusex_glidevk.sh install` used to point
+`WindowedRenderDevice` at GlideDrv too. Unreal's GlideDrv is fullscreen-only
+(its `SetRes` returns 0 for a windowed request), and on `WM_KILLFOCUS` the engine
+re-initialises with the *windowed* device — so any focus loss produced
+`3d hardware initialization failed` → `Assertion failed: RenDev`, with real Glide
+drivers as well. The script now leaves the windowed device on SoftDrv; the game
+drops to software while minimised and re-enters Glide fullscreen on restore
+(verified: minimise + restore mid-intro, clean exit). Also fixed alongside: the
+`GR_RESOLUTION_*` table had code 7 as 960x720; per `glide.h` it is 640x480 (9 is
+960x720), so every viewport was mis-sized — now a `ScreenResolution` enum in
+core with the header values. The first cause, the device thrash: On
 `WM_KILLFOCUS` in fullscreen, Unreal *resets* the render device with a
 `grSstWinClose` → `grGlideShutdown` → `grSstWinOpen` → `grGlideShutdown` dance.
 GlideVK used to destroy and recreate the entire Vulkan device on each of those,
@@ -116,28 +127,37 @@ the window size changed). Verified by reproducing the crash (launch on `:0`,
 restore. Windowed mode (`examples/deusex_glidevk.sh install windowed`) remains a
 belt-and-braces option but is no longer required.
 
-**Intro logos rendered as grids of dark dots — texture tiling seams.** The flat
-2D-overlay quads (logo/title bitmaps, the glow) arrive with affine texture coords
-far outside [0,1] (`sow` up to ~1250 vs perspective world geometry's <~1 — a
-coordinate bug in how un-divided ST is handled). Deus Ex sets `grTexClampMode` to
-WRAP globally, so those out-of-range coords tile the texture and every tile seam
-shows as a dark dot. Fix: a second CLAMP sampler + per-texture descriptors,
-selected per-draw by `wants_clamp`, which clamps **affine** primitives (constant
-`oow`/`1-w` across the corners = a flat overlay) and wraps **perspective** ones
-(varying `oow` = a projected/3D surface, incl. gameplay walls that legitimately
-tile). This makes the "Deus Ex" title, the emblem, and the Ion Storm glow render
-as clean shapes on black, keeps gameplay tiling working, and avoids clamping the
-perspective backdrop into a flat edge-texel fill. **Follow-up:** still a
-workaround — the real fix is recovering correct affine ST so coords land in
-[0,1] and honoring `grTexClampMode` directly.
+**Intro logos rendered as grids of dark dots — was a texture-coordinate space
+bug, now fixed (and verified against nGlide).** Glide's s/t coordinates are not
+in texels: they span `[0,256)` on the texture's *larger* axis whatever its pixel
+size, and `[0,256/aspect)` on the smaller one. GlideVK normalised by the pixel
+size instead, so a 32x32 logo texture addressed with s,t≈(218,131) — a point
+inside the texture — tiled 8x and every tile seam showed as a dark dot. The
+shader now maps `uv = st * major / (256 * texSize)`. The per-draw "clamp affine
+primitives" heuristic that hid the symptom is gone; `grTexClampMode` is honoured
+directly (a `tex_clamp` flag in the shared core state, both shells). Effect on
+Deus Ex: the Ion Storm logo now renders as a clean shape, and the emblem shows
+its green glow instead of flat dark blue. The convention was pinned down by
+`examples/wine_texcoord.c` run beside nGlide's `glide2x.dll` — see *Differential
+testing* below.
 
-**Eidos logo (the very first intro segment, ~first 7 s) still renders black —
-unsolved.** Those frames draw fullscreen quads whose texture coordinates, after
-the perspective divide, land in the tens of thousands and are heavily skewed
-(non-parallel edges — a projected mapping, not a flat bitmap); they sample dark
-texture data whether wrapped or clamped, so nothing visible appears. No brighter
-Eidos element was found in that window. Decoding this needs a reference (how real
-3dfx / nGlide renders that exact early frame) to calibrate the coordinate scheme.
+**Eidos logo (the first intro segment) rendered black — fixed; it was
+palette timing.** The 3dfx logo that nGlide shows before it is nGlide's own
+splash (drawn by the DLL, `NGLIDE_SPLASH`), not the game. The Eidos mark is a
+mesh with a 64x64 `GR_TEXFMT_P_8` skin, and the `GLIDEVK_TRACE_FRAMES` call
+trace shows Unreal's order per texture: `grTexDownloadMipMapLevel` →
+`grTexSource` → **`grTexDownloadTable` (its palette)** → draws. Glide's TMU
+applies the palette at draw time, but GlideVK decoded palettised textures at
+download/bind time — against the *previous* texture's palette (the all-black
+one of the 2x2 base texture that Unreal binds just before). Every P8 texture
+therefore decoded black. Fix: P8 downloads keep only their indices; at each
+draw the bound P8 texture is resolved against the palette live at that moment
+(`TextureCache::p8_draw`), cached per palette *content* (`variant_key`, up to
+`MAX_P8_VARIANTS` per address) so Unreal's alternating per-texture palettes
+map back to resident variants instead of re-uploading. This replaced the
+"re-decode at bind, capped once per frame" scheme, and the intro runs at ~70
+fps instead of ~10. glide3x still decodes at download time; Diablo II should
+get the same treatment.
 
 **GPU crash (GPUVM/TCP fault) during the intro — texture re-upload race.** The P8
 palette re-decode replaces a texture mid-frame; destroying the old `GpuTexture`
@@ -153,20 +173,10 @@ in the combiner's final output (per-fragment; exact for single-layer geometry
 over black, which is where it matters). This alone takes the flying Deus Ex
 emblem from pure black to a visible dark-blue shape.
 
-**Black intro logos = palettized (`GR_TEXFMT_P_8`) textures animated by palette
-cycling.** Deus Ex uploads its intro-logo textures as 8-bit palettized (`fmt
-0x5`) and fades them in by re-uploading the palette via `grTexDownloadTable`
-**hundreds of times** (a gray ramp cycling against zero). Real 3dfx has a live
-palette LUT, so the logo brightens as the palette ramps. We baked the palette at
-*decode* time — and the texture is downloaded while the palette is still zero, so
-it decoded to solid black and never updated. Fix: cache each P8 texture's raw
-index data (`TextureCache::p8_sources`); on `grTexDownloadTable` just bump a
-palette version; re-decode a P8 texture lazily when it's next bound
-(`take_p8_redecode`), **capped to once per texture per frame** so the continuous
-palette animation doesn't trigger a per-bind re-upload storm (an uncapped version
-dropped the game to ~10 fps; the cap restores ~37 fps). The proper long-term fix
-is a palette LUT in the shader (upload indices once, update only a 256-entry
-palette buffer) — that would remove the re-upload cost entirely.
+**Palettised (`GR_TEXFMT_P_8`) textures — superseded.** The earlier
+"re-decode lazily at bind, capped once per texture per frame" approach is gone;
+see the Eidos entry above for the draw-time, per-palette-content variant cache
+that replaced it. The long-term option remains a palette LUT in the shader.
 
 **Flat intro logos (Eidos mark, Deus Ex arcs, Ion Storm mark) render but are
 nearly invisible without gamma.** They draw with
@@ -185,17 +195,21 @@ e.g. `GLIDEVK_GAMMA=3.0` makes the emblem arcs and orb clearly visible (verified
 against a normal-vs-boosted capture). It's the practical way to match a reference
 renderer's brightness without hard-coding a value.
 
-**Blend enum — now canonical, which made the Ion Storm logo appear.** For a
-while `map_blend_factor` used a *non-canonical* table (reverse-engineered to make
-Deus Ex's additive glow look right). It was wrong: Glide's `GrAlphaBlendFnc_t`
-codes are fixed ABI. The real subtlety is Glide's src/dst operand rule — the
-`_COLOR` codes name the *other* operand (`0x2` = DST_COLOR on the source factor
-but SRC_COLOR on the dest factor; likewise `0x4`). Handling that (`map_blend_factor(v,
-is_src)`) makes the canonical table correct for *both* standard Glide programs
-(see `examples/wine_blend.c`, which failed under the old table) and Deus Ex.
-Concretely, the Ion Storm logo — previously composited *away* by the wrong blend
-and hidden inside its glow — now reads through it as "ION STORM". The controlled
-`wine_blend`/`wine_depth`/`wine_texmap` harnesses are what surfaced this.
+**Blend factor codes — were permuted, now per `glide.h` and verified against
+nGlide.** `map_blend_factor` had 3/4/5/6 shuffled (ONE was 6, ONE_MINUS_SRC_ALPHA
+was 3) and its "verified by wine_blend" claim was circular: that harness used
+the same wrong defines. `examples/wine_blendmode.c` walks every code on both
+sides through the reference; the resulting table lives in
+`BlendFactor::from_glide` (core, shared by both shells): 0 ZERO, 1 SRC_ALPHA,
+2 SRC/DST_COLOR, 3 DST_ALPHA, 4 ONE, 5 ONE_MINUS_SRC_ALPHA, 6 ONE_MINUS_SRC/
+DST_COLOR, 7 ONE_MINUS_DST_ALPHA, 0xf ALPHA_SATURATE (src) / PREFOG_COLOR
+(dst, = source colour with fog off). The `_COLOR` codes name the other
+operand, so the side matters. With the real table Unreal's translucent
+`(ONE, ONE_MINUS_SRC_COLOR)` glow and modulated `(DST_COLOR, SRC_COLOR)`
+lightmaps composite as intended; the emblem is now a lit metallic mesh rather
+than a flat dark shape. Iterated vertex colours are also clamped to [0,255] in
+the vertex shader, as the hardware does (Unreal leaves unused channels as
+garbage such as 885 / -497).
 
 **Safe-mode dialog after a crash.** Unreal drops a 0-byte `System/Running.ini`
 marker at boot and removes it only on a *clean* exit. Any crash (e.g. the
@@ -215,3 +229,35 @@ offline.
 - Force Glide with `-3dfx` (Lutris's default launch does not).
 - Drop `glide3x.dll` beside `Diablo II.exe` (the game dir has none; the loader
   finds it before the system32 nGlide copy) — non-destructive.
+
+## Differential testing — the reference decides
+
+The `examples/wine_*.c` harnesses used to check GlideVK against GlideVK's own
+assumptions (the comment in `wine_texmap.c` literally described our divide and
+then wrote coordinates to match it, so it could only pass). The texture-space
+bug above survived that. The fix is methodological:
+
+- **`examples/run_diff.sh [harness...]`** builds `glide2x.dll`, runs each harness
+  beside a *reference* `glide2x.dll` (default: the nGlide copy backed up by
+  `deusex_glidevk.sh`; override with `GLIDE2X_REF`) and beside ours, and diffs
+  their stdout. `PASS` means we match the reference, not our expectation.
+- Harnesses in this style read pixels back with **`grLfbReadRegion`**, which every
+  Glide 2 implementation exports (the older ones use GlideVK-only debug exports
+  and cannot run against a reference). GlideVK's `grLfbReadRegion` is now real:
+  it serves the last presented frame as RGB565 (the first call turns on a
+  per-frame host copy, so a read before any subsequent present returns zeros).
+- `wine_texcoord.c` is the first such harness: nGlide answers `red green blue
+  white` / `red green` for the 0..256 mapping, and so do we now.
+- Harness `GR_RESOLUTION` codes were also wrong (5 = 640x350, not 640x480); they
+  now use 7.
+- `wine_blendmode.c`: every `GrAlphaBlendFnc_t` code on both sides, quantised
+  to 8 levels per channel so 565 rounding cannot flip a bucket.
+- Diagnostics that made the palette bug visible: `GLIDEVK_TRACE_FRAMES=<n>`
+  logs every traced call (downloads, palette uploads, binds, draws, clears,
+  swaps) in order for the first n frames; `GLIDEVK_TEXDUMP=<dir>` writes each
+  distinct uploaded texture, and each P8 variant, as a PPM.
+
+When something in a game looks wrong, the order is: reproduce the exact Glide
+call pattern in a harness, run it through the reference, then fix — not the
+other way round.
+

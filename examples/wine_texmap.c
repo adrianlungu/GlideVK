@@ -6,9 +6,10 @@
  * colour quadrants (red top-left, green top-right, blue bottom-left, white
  * bottom-right); tiling or a flipped/rotated result reveals a coordinate bug.
  *
- * Glide2 delivers ST as sow=s/w, tow=t/w with oow=1/w; GlideVK recovers
- * s=sow/oow then normalises by the texture size. So to span the texture once
- * with no perspective (oow=1), sow/tow run 0..texSize (here 0..2).
+ * Glide2 delivers ST as sow=s/w, tow=t/w with oow=1/w. Glide's texture
+ * coordinate space is [0,256) on the texture's major axis whatever its pixel
+ * size (see wine_texcoord.c, which verifies this against nGlide), so to span
+ * the texture once with no perspective (oow=1), sow/tow run 0..256.
  *
  * Capture the frame for offline inspection:
  *   GLIDEVK_CAPTURE=texmap.ppm i686 ... wine wine_texmap.exe
@@ -43,7 +44,7 @@ typedef void(__stdcall *combine_fn)(int, int, int, int, int);
 typedef void(__stdcall *texdl_fn)(int, int, int, GrTexInfo *);
 typedef void(__stdcall *tri_fn)(void *, void *, void *);
 
-#define GR_RES_640x480 5
+#define GR_RES_640x480 7    /* GR_RESOLUTION_640x480 per glide.h (5 is 640x350) */
 #define GR_ORIGIN_UPPER_LEFT 0
 #define GR_LOD_2 7            /* 2x2 (LOD counts down from 256=0 to 1=8) */
 #define GR_ASPECT_1x1 3
@@ -103,9 +104,9 @@ int main(void) {
     grColorCombine(GR_COMBINE_FUNCTION_SCALE_OTHER, GR_COMBINE_FACTOR_ONE,
                    GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_TEXTURE, 0);
 
-    /* Screen-covering quad (two triangles). ST spans 0..2 (= texSize) so the
-     * 2x2 texture maps exactly once; oow=1 (no perspective). */
-    const float W = 640, H = 480, T = 2.0f;
+    /* Screen-covering quad (two triangles). ST spans 0..256 (Glide's
+     * coordinate range) so the 2x2 texture maps exactly once; oow=1. */
+    const float W = 640, H = 480, T = 256.0f;
     GrVertex q[4] = {0};
     float PX[4][2] = {{0,0},{W,0},{W,H},{0,H}};
     float ST[4][2] = {{0,0},{T,0},{T,T},{0,T}};

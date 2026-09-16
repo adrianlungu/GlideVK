@@ -116,6 +116,51 @@ pub enum BlendFactor {
     AlphaSaturate,
 }
 
+impl BlendFactor {
+    /// Map a `GrAlphaBlendFnc_t` code, per `glide.h`: 0 ZERO, 1 SRC_ALPHA,
+    /// 2 SRC_COLOR/DST_COLOR, 3 DST_ALPHA, 4 ONE, 5 ONE_MINUS_SRC_ALPHA,
+    /// 6 ONE_MINUS_SRC_COLOR/ONE_MINUS_DST_COLOR, 7 ONE_MINUS_DST_ALPHA,
+    /// 0xf ALPHA_SATURATE (source side) / PREFOG_COLOR (destination side).
+    ///
+    /// The `_COLOR` codes name the *other* operand, so `is_src` selects the
+    /// side; with fog off the pre-fog colour is the source colour. Verified
+    /// against nGlide by `examples/wine_blendmode.c` via `run_diff.sh`, which
+    /// walks every code on both sides.
+    pub fn from_glide(code: i32, is_src: bool) -> Self {
+        use BlendFactor::*;
+        match code {
+            0x0 => Zero,
+            0x1 => SrcAlpha,
+            0x2 => {
+                if is_src {
+                    DstColor
+                } else {
+                    SrcColor
+                }
+            }
+            0x3 => DstAlpha,
+            0x4 => One,
+            0x5 => OneMinusSrcAlpha,
+            0x6 => {
+                if is_src {
+                    OneMinusDstColor
+                } else {
+                    OneMinusSrcColor
+                }
+            }
+            0x7 => OneMinusDstAlpha,
+            0xf => {
+                if is_src {
+                    AlphaSaturate
+                } else {
+                    SrcColor
+                }
+            }
+            _ => Zero,
+        }
+    }
+}
+
 /// Texture internal formats (`GR_TEXFMT_*`).
 ///
 /// These are what games hand to `grTexDownloadMipMap`; the texture cache
@@ -133,4 +178,125 @@ pub enum TexFormat {
     P8,       // palettized
     Yiq422,   // NCC-compressed
     Ayiq8422, // NCC-compressed with alpha
+}
+
+/// Screen resolutions (`GrScreenResolution_t`, `GR_RESOLUTION_*`).
+///
+/// Discriminants are the exact `glide.h` codes that `grSstWinOpen` receives, so
+/// the shells can convert with [`ScreenResolution::from_code`]. `None` (0xff)
+/// means "use the window size" in Glide 3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ScreenResolution {
+    R320x200 = 0x0,
+    R320x240 = 0x1,
+    R400x256 = 0x2,
+    R512x384 = 0x3,
+    R640x200 = 0x4,
+    R640x350 = 0x5,
+    R640x400 = 0x6,
+    R640x480 = 0x7,
+    R800x600 = 0x8,
+    R960x720 = 0x9,
+    R856x480 = 0xa,
+    R512x256 = 0xb,
+    R1024x768 = 0xc,
+    R1280x1024 = 0xd,
+    R1600x1200 = 0xe,
+    R400x300 = 0xf,
+    None = 0xff,
+}
+
+impl ScreenResolution {
+    /// Decode a raw `GR_RESOLUTION_*` code; unknown codes decode to `None`.
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            0x0 => Self::R320x200,
+            0x1 => Self::R320x240,
+            0x2 => Self::R400x256,
+            0x3 => Self::R512x384,
+            0x4 => Self::R640x200,
+            0x5 => Self::R640x350,
+            0x6 => Self::R640x400,
+            0x7 => Self::R640x480,
+            0x8 => Self::R800x600,
+            0x9 => Self::R960x720,
+            0xa => Self::R856x480,
+            0xb => Self::R512x256,
+            0xc => Self::R1024x768,
+            0xd => Self::R1280x1024,
+            0xe => Self::R1600x1200,
+            0xf => Self::R400x300,
+            _ => Self::None,
+        }
+    }
+
+    /// Pixel dimensions, or `None` for [`ScreenResolution::None`].
+    pub fn dimensions(self) -> Option<(u32, u32)> {
+        Some(match self {
+            Self::R320x200 => (320, 200),
+            Self::R320x240 => (320, 240),
+            Self::R400x256 => (400, 256),
+            Self::R512x384 => (512, 384),
+            Self::R640x200 => (640, 200),
+            Self::R640x350 => (640, 350),
+            Self::R640x400 => (640, 400),
+            Self::R640x480 => (640, 480),
+            Self::R800x600 => (800, 600),
+            Self::R960x720 => (960, 720),
+            Self::R856x480 => (856, 480),
+            Self::R512x256 => (512, 256),
+            Self::R1024x768 => (1024, 768),
+            Self::R1280x1024 => (1280, 1024),
+            Self::R1600x1200 => (1600, 1200),
+            Self::R400x300 => (400, 300),
+            Self::None => return None,
+        })
+    }
+}
+
+/// Pixel size for a raw `grSstWinOpen` resolution code, defaulting to 640×480
+/// for `GR_RESOLUTION_NONE` / unknown codes (the Voodoo1 baseline).
+pub fn resolution_to_size(code: u32) -> (u32, u32) {
+    ScreenResolution::from_code(code)
+        .dimensions()
+        .unwrap_or_else(|| ScreenResolution::R640x480.dimensions().unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blend_codes_match_glide_h() {
+        use BlendFactor::*;
+        // Unreal's SetBlending: default (4,0), translucent (4,6), modulated
+        // (2,2), masked (1,5).
+        assert_eq!(BlendFactor::from_glide(4, true), One);
+        assert_eq!(BlendFactor::from_glide(0, false), Zero);
+        assert_eq!(BlendFactor::from_glide(6, false), OneMinusSrcColor);
+        assert_eq!(BlendFactor::from_glide(6, true), OneMinusDstColor);
+        assert_eq!(BlendFactor::from_glide(2, true), DstColor);
+        assert_eq!(BlendFactor::from_glide(2, false), SrcColor);
+        assert_eq!(BlendFactor::from_glide(1, true), SrcAlpha);
+        assert_eq!(BlendFactor::from_glide(5, false), OneMinusSrcAlpha);
+        assert_eq!(BlendFactor::from_glide(3, true), DstAlpha);
+        assert_eq!(BlendFactor::from_glide(0xf, true), AlphaSaturate);
+        assert_eq!(BlendFactor::from_glide(0xf, false), SrcColor);
+    }
+
+    #[test]
+    fn resolution_codes_match_glide_h() {
+        // Unreal-engine games ask for 7 (640x480) and 12 (1024x768); the old
+        // table had 7 => 960x720, which mis-sized every Deus Ex viewport.
+        assert_eq!(resolution_to_size(0x7), (640, 480));
+        assert_eq!(resolution_to_size(0x9), (960, 720));
+        assert_eq!(resolution_to_size(0xc), (1024, 768));
+        assert_eq!(ScreenResolution::from_code(0xff), ScreenResolution::None);
+        assert_eq!(resolution_to_size(0xff), (640, 480));
+        for code in 0..=0xf {
+            assert_eq!(ScreenResolution::from_code(code) as u32, code);
+            assert!(ScreenResolution::from_code(code).dimensions().is_some());
+        }
+    }
 }

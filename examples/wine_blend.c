@@ -29,13 +29,13 @@ typedef void(__stdcall *combine_fn)(int, int, int, int, int);
 typedef void(__stdcall *blend_fn)(int, int, int, int);
 typedef void(__stdcall *tri_fn)(void *, void *, void *);
 
-#define GR_RES_640x480 5
+#define GR_RES_640x480 7    /* GR_RESOLUTION_640x480 per glide.h (5 is 640x350) */
 #define GR_ORIGIN_UPPER_LEFT 0
 /* canonical Glide blend factors */
 #define GR_BLEND_ZERO 0x0
 #define GR_BLEND_SRC_ALPHA 0x1
-#define GR_BLEND_ONE_MINUS_SRC_ALPHA 0x3
-#define GR_BLEND_ONE 0x6
+#define GR_BLEND_ONE_MINUS_SRC_ALPHA 0x5
+#define GR_BLEND_ONE 0x4
 #define GR_COMBINE_FUNCTION_LOCAL 1
 #define GR_COMBINE_LOCAL_ITERATED 0
 

@@ -26,7 +26,7 @@ typedef void(__stdcall *u8_fn)(unsigned char);
 typedef int(__stdcall *result_fn)(void);
 typedef unsigned int(__stdcall *pixel_fn)(void);
 
-#define GR_RESOLUTION_640x480 5
+#define GR_RESOLUTION_640x480 7    /* per glide.h (5 is 640x350) */
 #define GR_ORIGIN_UPPER_LEFT 0
 #define GR_PARAM_XY 0x01
 #define GR_PARAM_Z 0x02

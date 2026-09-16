@@ -32,7 +32,7 @@ typedef void(__stdcall *blend_fn)(int, int, int, int);
 typedef void(__stdcall *texdl_fn)(int, int, int, GrTexInfo *);
 typedef void(__stdcall *tri_fn)(void *, void *, void *);
 
-#define GR_RES_640x480 5
+#define GR_RES_640x480 7    /* GR_RESOLUTION_640x480 per glide.h (5 is 640x350) */
 #define GR_ORIGIN_UPPER_LEFT 0
 #define GR_LOD_32 3
 #define GR_ASPECT_1x1 3
@@ -43,7 +43,7 @@ typedef void(__stdcall *tri_fn)(void *, void *, void *);
 #define GR_COMBINE_FACTOR_LOCAL 1
 #define GR_COMBINE_LOCAL_ITERATED 0
 #define GR_COMBINE_OTHER_TEXTURE 1
-#define GR_BLEND_ONE 0x6
+#define GR_BLEND_ONE 0x4
 #define NSTARS 260
 #define TW 32
 
