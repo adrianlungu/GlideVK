@@ -52,7 +52,8 @@ packing can be developed and tested without a Vulkan loader.
 
 ```sh
 examples/run_diff.sh                    # wine_texcoord beside nGlide and beside ours, diffed
-GLIDE2X_REF=/path/glide2x.dll examples/run_diff.sh wine_texcoord
+GLIDE_REF=/path/glide2x.dll examples/run_diff.sh wine_texcoord wine_blendmode
+GLIDE_API=glide3x examples/run_diff.sh wine3_palette   # glide3x shell, wine3_* harnesses
 ```
 
 Harnesses that read back through `grLfbReadRegion` run unchanged against any

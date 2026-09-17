@@ -48,10 +48,73 @@ pub struct Context {
     pub present_errors: u32,
     #[cfg(feature = "vulkan")]
     pub backend: Option<vk::Backend>,
+    /// TMU address selected by the last `grTexSource`.
+    pub bound_texture: u32,
 }
 
 impl Context {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// A palettised texture freshly decoded and uploaded by
+/// [`Context::bind_for_draw`], returned for diagnostics.
+pub struct P8Uploaded {
+    pub addr: u32,
+    pub palette_id: u64,
+    pub texture: texture::Texture,
+}
+
+#[cfg(feature = "vulkan")]
+impl Context {
+    /// `grTexSource`: remember the selection. Plain textures bind now;
+    /// palettised ones are resolved at draw time ([`Context::bind_for_draw`]),
+    /// because Glide's TMU applies its palette LUT when drawing and games
+    /// (Unreal) upload a texture's palette *after* binding it. Returns false
+    /// when a plain texture is unknown (the backend falls back to white).
+    pub fn bind_texture(&mut self, addr: u32) -> bool {
+        self.bound_texture = addr;
+        if self.textures.is_p8(addr) {
+            return true;
+        }
+        match self.backend.as_mut() {
+            Some(b) => b.set_texture(addr as u64),
+            None => false,
+        }
+    }
+
+    /// Download of a `GR_TEXFMT_P_8` texture: keep its indices for draw-time
+    /// decoding and drop the GPU variants of whatever was at `addr` before.
+    pub fn download_p8(&mut self, addr: u32, width: u32, height: u32, indices: Vec<u8>) {
+        let stale = self.textures.store_p8_source(addr, width, height, indices);
+        if let Some(b) = self.backend.as_mut() {
+            for key in stale {
+                b.release_texture(key);
+            }
+        }
+    }
+
+    /// Call before every draw: if the bound texture is palettised, bind the
+    /// variant decoded against the palette live *now*, uploading it first if
+    /// this (texture, palette) pair has no GPU copy yet.
+    pub fn bind_for_draw(&mut self) -> Option<P8Uploaded> {
+        let addr = self.bound_texture;
+        let resolved = self.textures.p8_draw(addr)?;
+        let palette_id = self.textures.palette_id();
+        let b = self.backend.as_mut()?;
+        for key in resolved.release {
+            b.release_texture(key);
+        }
+        let uploaded = resolved.upload.map(|tex| {
+            let _ = b.upload_texture(resolved.key, tex.width, tex.height, &tex.rgba);
+            P8Uploaded {
+                addr,
+                palette_id,
+                texture: tex,
+            }
+        });
+        b.set_texture(resolved.key);
+        uploaded
     }
 }

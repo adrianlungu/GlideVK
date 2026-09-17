@@ -392,52 +392,40 @@ unsafe fn read_vertex(base: *const u8) -> DrawVertex {
     }
 }
 
-/// Bind the texture selected by `grTexSource` for a draw. Palettised textures
-/// are decoded against the palette live *now* (Glide's TMU applies its LUT at
-/// draw time), cached per palette content so alternating palettes don't churn.
-fn bind_draw_texture(
-    textures: &mut glidevk_core::texture::TextureCache,
-    backend: &mut glidevk_core::vk::Backend,
-) {
-    let addr = LAST_TEX_ADDR.load(Ordering::Relaxed);
-    let Some(resolved) = textures.p8_draw(addr) else {
-        return; // plain texture: bound at grTexSource
+/// Bind the texture selected by `grTexSource` for a draw (see
+/// `Context::bind_for_draw`), logging each freshly decoded palette variant.
+fn bind_draw_texture(ctx: &mut Context) {
+    let Some(up) = ctx.bind_for_draw() else {
+        return;
     };
-    for key in resolved.release {
-        backend.release_texture(key);
-    }
-    if let Some(tex) = resolved.upload {
-        let n = (tex.rgba.len() / 4).max(1) as u64;
-        let avg = |c: usize| tex.rgba.chunks_exact(4).map(|p| p[c] as u64).sum::<u64>() / n;
-        log_distinct(
-            8 << 40 | (addr as u64) << 8 | avg(0),
+    let tex = &up.texture;
+    let n = (tex.rgba.len() / 4).max(1) as u64;
+    let avg = |c: usize| tex.rgba.chunks_exact(4).map(|p| p[c] as u64).sum::<u64>() / n;
+    log_distinct(
+        8 << 40 | (up.addr as u64) << 8 | avg(0),
+        &format!(
+            "p8 variant frame={} addr={:#x} palette={} {}x{} avgRGB=({},{},{})",
+            FRAME.load(Ordering::Relaxed),
+            up.addr,
+            up.palette_id,
+            tex.width,
+            tex.height,
+            avg(0),
+            avg(1),
+            avg(2)
+        ),
+    );
+    if let Ok(dir) = std::env::var("GLIDEVK_TEXDUMP") {
+        write_ppm(
             &format!(
-                "p8 variant frame={} addr={addr:#x} palette={} {}x{} avgRGB=({},{},{})",
-                FRAME.load(Ordering::Relaxed),
-                textures.palette_id(),
-                tex.width,
-                tex.height,
-                avg(0),
-                avg(1),
-                avg(2)
+                "{dir}/p8_{:#07x}_pal{}_{}x{}.ppm",
+                up.addr, up.palette_id, tex.width, tex.height
             ),
+            tex.width,
+            tex.height,
+            &tex.rgba,
         );
-        if let Ok(dir) = std::env::var("GLIDEVK_TEXDUMP") {
-            write_ppm(
-                &format!(
-                    "{dir}/p8_{addr:#07x}_pal{}_{}x{}.ppm",
-                    textures.palette_id(),
-                    tex.width,
-                    tex.height
-                ),
-                tex.width,
-                tex.height,
-                &tex.rgba,
-            );
-        }
-        let _ = backend.upload_texture(resolved.key, tex.width, tex.height, &tex.rgba);
     }
-    backend.set_texture(resolved.key);
 }
 
 fn submit_fan(verts: &[DrawVertex]) {
@@ -477,8 +465,8 @@ fn submit_fan(verts: &[DrawVertex]) {
         if std::env::var_os("GLIDEVK_LOG").is_some() {
             shade = shade_desc(&ctx.state);
         }
+        bind_draw_texture(ctx);
         if let Some(b) = ctx.backend.as_mut() {
-            bind_draw_texture(&mut ctx.textures, b);
             b.set_combine(combine);
             b.set_blend(blend);
             b.set_depth(depth);
@@ -1099,14 +1087,7 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
         // see `bind_draw_texture`. Any GPU variants of a previous texture at this
         // address are stale.
         if matches!(fmt, TexFormat::P8) {
-            let stale = ctx
-                .textures
-                .store_p8_source(start_address, w, h, src.to_vec());
-            if let Some(b) = ctx.backend.as_mut() {
-                for key in stale {
-                    b.release_texture(key);
-                }
-            }
+            ctx.download_p8(start_address, w, h, src.to_vec());
         }
         match ctx.textures.decode(fmt, w, h, src) {
             Ok(tex) => {
@@ -1207,13 +1188,8 @@ pub extern "system" fn grTexSource(
     LAST_TEX_ADDR.store(start_address, Ordering::Relaxed);
     trace(&format!("grTexSource addr={start_address:#x}"));
     with_ctx(|ctx| {
-        // Palettised textures are resolved per draw (`bind_draw_texture`).
-        if ctx.textures.is_p8(start_address) {
-            return;
-        }
-        if let Some(b) = ctx.backend.as_mut() {
-            let found = b.set_texture(start_address as u64);
-            if !found {
+        if !ctx.bind_texture(start_address) {
+            {
                 log_once(
                     &LOG_TS,
                     &format!("grTexSource addr={start_address:#x} -> NO texture (default white)"),
@@ -1322,8 +1298,8 @@ pub unsafe extern "system" fn grDrawTriangle(
         if std::env::var_os("GLIDEVK_LOG").is_some() {
             shade = shade_desc(&ctx.state);
         }
+        bind_draw_texture(ctx);
         if let Some(bk) = ctx.backend.as_mut() {
-            bind_draw_texture(&mut ctx.textures, bk);
             bk.set_combine(combine);
             bk.set_blend(blend);
             bk.set_depth(depth);
@@ -1442,33 +1418,12 @@ pub unsafe extern "system" fn grLfbReadRegion(
         let Some(b) = ctx.backend.as_mut() else {
             return 0;
         };
-        b.set_full_readback(true);
-        let (lw, lh) = b.logical_size();
-        let Some((fw, fh, rgba)) = b.last_frame() else {
+        if !b.read_region_rgb565(src_x, src_y, src_w, src_h, dst_stride, dst) {
             glidevk_log("grLfbReadRegion: no frame presented since readback enabled");
-            dst.fill(0);
-            return 1;
-        };
-        for row in 0..src_h {
-            let fy = ((src_y + row) * fh / lh.max(1)).min(fh - 1) as usize;
-            for col in 0..src_w {
-                let fx = ((src_x + col) * fw / lw.max(1)).min(fw - 1) as usize;
-                let i = (fy * fw as usize + fx) * 4;
-                let px = pack_rgb565(rgba[i], rgba[i + 1], rgba[i + 2]);
-                let o = (row * dst_stride + col * 2) as usize;
-                if o + 2 <= dst.len() {
-                    dst[o..o + 2].copy_from_slice(&px.to_le_bytes());
-                }
-            }
         }
         1
     })
     .unwrap_or(0)
-}
-
-/// Pack 8-bit RGB into the Glide framebuffer's RGB565.
-fn pack_rgb565(r: u8, g: u8, b: u8) -> u16 {
-    ((r as u16 >> 3) << 11) | ((g as u16 >> 2) << 5) | (b as u16 >> 3)
 }
 
 #[export_name = "grLfbWriteRegion"]
@@ -1704,19 +1659,5 @@ mod tests {
             ..info
         };
         assert_eq!(tex_dims(&info8), (8, 8)); // GR_LOD_8 = 5
-    }
-}
-
-#[cfg(test)]
-mod lfb_tests {
-    use super::pack_rgb565;
-
-    #[test]
-    fn rgb565_packing_matches_glide_framebuffer_layout() {
-        assert_eq!(pack_rgb565(255, 0, 0), 0xF800);
-        assert_eq!(pack_rgb565(0, 255, 0), 0x07E0);
-        assert_eq!(pack_rgb565(0, 0, 255), 0x001F);
-        assert_eq!(pack_rgb565(255, 255, 255), 0xFFFF);
-        assert_eq!(pack_rgb565(0, 0, 0), 0x0000);
     }
 }

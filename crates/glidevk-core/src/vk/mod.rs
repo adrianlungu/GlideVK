@@ -1360,6 +1360,41 @@ impl Backend {
             .map(|(w, h, px)| (*w, *h, px.as_slice()))
     }
 
+    /// `grLfbReadRegion`: copy a rectangle of the last presented frame into
+    /// `dst` as RGB565 rows of `dst_stride` bytes. Coordinates are in the
+    /// game's logical space and scaled to the frame's extent. The first call
+    /// enables per-frame readback, so until a frame has been presented since,
+    /// the region is zero-filled; returns whether frame data was available.
+    pub fn read_region_rgb565(
+        &mut self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        dst_stride: u32,
+        dst: &mut [u8],
+    ) -> bool {
+        self.set_full_readback(true);
+        let (lw, lh) = self.logical_size();
+        let Some((fw, fh, rgba)) = self.last_frame() else {
+            dst.fill(0);
+            return false;
+        };
+        for row in 0..h {
+            let fy = ((y + row) * fh / lh.max(1)).min(fh - 1) as usize;
+            for col in 0..w {
+                let fx = ((x + col) * fw / lw.max(1)).min(fw - 1) as usize;
+                let i = (fy * fw as usize + fx) * 4;
+                let px = crate::lfb::pack_rgb565(rgba[i], rgba[i + 1], rgba[i + 2]);
+                let o = (row * dst_stride + col * 2) as usize;
+                if o + 2 <= dst.len() {
+                    dst[o..o + 2].copy_from_slice(&px.to_le_bytes());
+                }
+            }
+        }
+        true
+    }
+
     /// Begin a frame's render pass if one is not already in progress: wait for
     /// the previous frame, acquire an image, and start recording with the
     /// pipeline, vertex buffer, viewport, and push constants bound.

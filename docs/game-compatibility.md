@@ -156,8 +156,9 @@ draw the bound P8 texture is resolved against the palette live at that moment
 `MAX_P8_VARIANTS` per address) so Unreal's alternating per-texture palettes
 map back to resident variants instead of re-uploading. This replaced the
 "re-decode at bind, capped once per frame" scheme, and the intro runs at ~70
-fps instead of ~10. glide3x still decodes at download time; Diablo II should
-get the same treatment.
+fps instead of ~10. The logic lives in the shared core (`Context::bind_texture`
+/ `download_p8` / `bind_for_draw`), so glide3x has it too; nGlide's glide3x
+confirms the same draw-time semantics (`examples/wine3_palette.c`).
 
 **GPU crash (GPUVM/TCP fault) during the intro — texture re-upload race.** The P8
 palette re-decode replaces a texture mid-frame; destroying the old `GpuTexture`
@@ -252,6 +253,13 @@ bug above survived that. The fix is methodological:
   now use 7.
 - `wine_blendmode.c`: every `GrAlphaBlendFnc_t` code on both sides, quantised
   to 8 levels per channel so 565 rounding cannot flip a bucket.
+- `wine3_palette.c` (glide3x): downloads a P8 texture, binds it, uploads its
+  palette *after* the bind, draws; then swaps palettes without rebinding. The
+  reference answers green / red / blue — the palette live at each draw — and
+  so do we. Run with `GLIDE_API=glide3x`; the runner then builds `glide3x.dll`
+  and defaults the reference to nGlide's `glide3x.dll` in the Deus Ex install.
+  Both shells' `grLfbReadRegion` are real and share
+  `Backend::read_region_rgb565`.
 - Diagnostics that made the palette bug visible: `GLIDEVK_TRACE_FRAMES=<n>`
   logs every traced call (downloads, palette uploads, binds, draws, clears,
   swaps) in order for the first n frames; `GLIDEVK_TEXDUMP=<dir>` writes each

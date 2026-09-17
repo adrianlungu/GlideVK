@@ -73,6 +73,12 @@ impl LfbLock {
     }
 }
 
+/// Pack 8-bit RGB into the Glide framebuffer's RGB565 (what `grLfbReadRegion`
+/// and 16-bit LFB locks hand back to the game).
+pub fn pack_rgb565(r: u8, g: u8, b: u8) -> u16 {
+    ((r as u16 >> 3) << 11) | ((g as u16 >> 2) << 5) | (b as u16 >> 3)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,5 +95,14 @@ mod tests {
         };
         lock.pack_from_rgba8(&[0xff, 0x00, 0x00, 0xff]);
         assert_eq!(u16::from_le_bytes([lock.data[0], lock.data[1]]), 0xF800);
+    }
+
+    #[test]
+    fn rgb565_packing_matches_glide_framebuffer_layout() {
+        assert_eq!(pack_rgb565(255, 0, 0), 0xF800);
+        assert_eq!(pack_rgb565(0, 255, 0), 0x07E0);
+        assert_eq!(pack_rgb565(0, 0, 255), 0x001F);
+        assert_eq!(pack_rgb565(255, 255, 255), 0xFFFF);
+        assert_eq!(pack_rgb565(0, 0, 0), 0x0000);
     }
 }

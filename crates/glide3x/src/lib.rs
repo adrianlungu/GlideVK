@@ -502,6 +502,7 @@ fn submit_triangles(tris: &[DrawVertex]) {
             ctx.state.chroma_key[2],
         ];
         let (at_func, at_ref) = (ctx.state.alpha_test_func, ctx.state.alpha_test_ref);
+        ctx.bind_for_draw();
         if let Some(backend) = ctx.backend.as_mut() {
             backend.set_combine(combine);
             backend.set_blend(blend);
@@ -679,6 +680,13 @@ unsafe fn download_texture(start_address: u32, info: &GrTexInfo) {
     let src_len = (w as usize) * (h as usize) * texfmt_bpp(fmt);
     let src = std::slice::from_raw_parts(info.data as *const u8, src_len);
     with_ctx(|ctx| {
+        // Palettised textures are decoded per draw against the palette live
+        // at that moment (Glide applies its LUT when drawing; games upload a
+        // texture's palette after binding it) — see `Context::bind_for_draw`.
+        if matches!(fmt, TexFormat::P8) {
+            ctx.download_p8(start_address, w, h, src.to_vec());
+            return;
+        }
         let decoded = match ctx.textures.decode(fmt, w, h, src) {
             Ok(t) => t,
             Err(_) => return,
@@ -697,9 +705,7 @@ pub extern "system" fn grTexSource(
     _info: *const GrTexInfo,
 ) {
     with_ctx(|ctx| {
-        if let Some(backend) = ctx.backend.as_mut() {
-            backend.set_texture(start_address as u64);
-        }
+        ctx.bind_texture(start_address);
     });
 }
 
@@ -942,17 +948,36 @@ pub extern "system" fn grLfbWriteRegion(
     1
 }
 
+/// `grLfbReadRegion`: a rectangle of the last presented frame as RGB565 (see
+/// `Backend::read_region_rgb565` for the readback semantics).
+///
+/// # Safety
+/// `dst_data` must point to at least `src_height * dst_stride` writable bytes.
 #[export_name = "grLfbReadRegion"]
-pub extern "system" fn grLfbReadRegion(
+pub unsafe extern "system" fn grLfbReadRegion(
     _src_buffer: i32,
-    _src_x: u32,
-    _src_y: u32,
-    _src_width: u32,
-    _src_height: u32,
-    _dst_stride: u32,
-    _dst_data: *mut core::ffi::c_void,
+    src_x: u32,
+    src_y: u32,
+    src_width: u32,
+    src_height: u32,
+    dst_stride: u32,
+    dst_data: *mut core::ffi::c_void,
 ) -> FxBool {
-    1
+    if dst_data.is_null() || src_width == 0 || src_height == 0 {
+        return 0;
+    }
+    let dst = std::slice::from_raw_parts_mut(
+        dst_data as *mut u8,
+        (src_height as usize) * (dst_stride as usize),
+    );
+    with_ctx(|ctx| match ctx.backend.as_mut() {
+        Some(b) => {
+            b.read_region_rgb565(src_x, src_y, src_width, src_height, dst_stride, dst);
+            1
+        }
+        None => 0,
+    })
+    .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
