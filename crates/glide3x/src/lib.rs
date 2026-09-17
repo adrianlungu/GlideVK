@@ -242,10 +242,10 @@ pub extern "system" fn grColorCombine(
     invert: FxBool,
 ) {
     with_ctx(|ctx| {
-        ctx.state.color_combine.function = map_combine_function(function);
-        ctx.state.color_combine.factor = map_combine_factor(factor);
-        ctx.state.color_combine.local = map_combine_local(local);
-        ctx.state.color_combine.other = map_combine_other(other);
+        ctx.state.color_combine.function = CombineFunction::from_glide(function);
+        ctx.state.color_combine.factor = CombineFactor::from_glide(factor);
+        ctx.state.color_combine.local = CombineLocal::from_glide(local);
+        ctx.state.color_combine.other = CombineOther::from_glide(other);
         ctx.state.color_combine.invert = invert != 0;
     });
 }
@@ -259,10 +259,10 @@ pub extern "system" fn grAlphaCombine(
     invert: FxBool,
 ) {
     with_ctx(|ctx| {
-        ctx.state.alpha_combine.function = map_combine_function(function);
-        ctx.state.alpha_combine.factor = map_combine_factor(factor);
-        ctx.state.alpha_combine.local = map_combine_local(local);
-        ctx.state.alpha_combine.other = map_combine_other(other);
+        ctx.state.alpha_combine.function = CombineFunction::from_glide(function);
+        ctx.state.alpha_combine.factor = CombineFactor::from_glide(factor);
+        ctx.state.alpha_combine.local = CombineLocal::from_glide(local);
+        ctx.state.alpha_combine.other = CombineOther::from_glide(other);
         ctx.state.alpha_combine.invert = invert != 0;
     });
 }
@@ -733,11 +733,11 @@ pub extern "system" fn grTexCombine(
 ) {
     with_ctx(|ctx| {
         let tc = &mut ctx.state.tex_combine[(tmu as usize).min(2)];
-        tc.rgb.function = map_combine_function(rgb_function);
-        tc.rgb.factor = map_combine_factor(rgb_factor);
+        tc.rgb.function = CombineFunction::from_glide(rgb_function);
+        tc.rgb.factor = CombineFactor::from_glide(rgb_factor);
         tc.rgb.invert = rgb_invert != 0;
-        tc.alpha.function = map_combine_function(alpha_function);
-        tc.alpha.factor = map_combine_factor(alpha_factor);
+        tc.alpha.function = CombineFunction::from_glide(alpha_function);
+        tc.alpha.factor = CombineFactor::from_glide(alpha_factor);
         tc.alpha.invert = alpha_invert != 0;
         tc.enabled = true;
         // Consumed by the shader once multitexture (TMU1/2) lands; single-TMU0
@@ -1118,67 +1118,6 @@ pub extern "system" fn glidevkCenterPixel() -> u32 {
 // ---------------------------------------------------------------------------
 // Enum mapping helpers (numeric GR_* -> core enums). Values per glide.h.
 // ---------------------------------------------------------------------------
-
-fn map_combine_function(v: i32) -> CombineFunction {
-    use CombineFunction::*;
-    match v {
-        0x0 => Zero,
-        0x1 => Local,
-        0x2 => LocalAlpha,
-        0x3 => ScaleOther,
-        0x4 => ScaleOtherAddLocal,
-        0x5 => ScaleOtherAddLocalAlpha,
-        0x6 => ScaleOtherMinusLocal,
-        0x7 => ScaleOtherMinusLocalAddLocal,
-        0x8 => ScaleOtherMinusLocalAddLocalAlpha,
-        0x9 => ScaleMinusLocalAddLocal,
-        0xa => ScaleMinusLocalAddLocalAlpha,
-        _ => Zero,
-    }
-}
-
-fn map_combine_factor(v: i32) -> CombineFactor {
-    use CombineFactor::*;
-    match v {
-        0x0 => Zero,
-        0x1 => Local,
-        0x2 => OtherAlpha,
-        0x3 => LocalAlpha,
-        0x4 => TextureAlpha,
-        0x5 => DetailFactor,
-        0x6 => LodFraction,
-        0x8 => One,
-        0x9 => OneMinusLocal,
-        0xa => OneMinusOtherAlpha,
-        0xb => OneMinusLocalAlpha,
-        0xc => OneMinusTextureAlpha,
-        0xd => OneMinusDetailFactor,
-        0xe => OneMinusLodFraction,
-        _ => Zero,
-    }
-}
-
-fn map_combine_local(v: i32) -> CombineLocal {
-    use CombineLocal::*;
-    match v {
-        0x0 => Iterated,
-        0x1 => Constant,
-        0x2 => None,
-        0x3 => Depth,
-        _ => Iterated,
-    }
-}
-
-fn map_combine_other(v: i32) -> CombineOther {
-    use CombineOther::*;
-    match v {
-        0x0 => Iterated,
-        0x1 => Texture,
-        0x2 => Constant,
-        0x3 => None,
-        _ => Iterated,
-    }
-}
 
 /// Declare a not-yet-implemented export that links and returns cleanly, so a
 /// game importing it does not fail to load. Fill these in per milestone.

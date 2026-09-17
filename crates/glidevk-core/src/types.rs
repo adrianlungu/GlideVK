@@ -47,8 +47,11 @@ pub enum CombineFunction {
     ScaleOtherMinusLocal,
     ScaleOtherMinusLocalAddLocal,
     ScaleOtherMinusLocalAddLocalAlpha,
-    ScaleMinusLocalAddLocal,
-    ScaleMinusLocalAddLocalAlpha,
+    /// `GR_COMBINE_FUNCTION_SCALE_MINUS_OTHER_ADD_LOCAL` (0x9, a.k.a.
+    /// `BLEND_LOCAL`): `f * (-other) + local`.
+    ScaleMinusOtherAddLocal,
+    /// `GR_COMBINE_FUNCTION_SCALE_MINUS_OTHER_ADD_LOCAL_ALPHA` (0x10).
+    ScaleMinusOtherAddLocalAlpha,
 }
 
 /// Combine factor selector (`GR_COMBINE_FACTOR_*`). Discriminants are the
@@ -161,6 +164,79 @@ impl BlendFactor {
     }
 }
 
+impl CombineFunction {
+    /// `GR_COMBINE_FUNCTION_*` per `glide.h`: ZERO 0, LOCAL 1, LOCAL_ALPHA 2,
+    /// SCALE_OTHER 3, SCALE_OTHER_ADD_LOCAL 4, SCALE_OTHER_ADD_LOCAL_ALPHA 5,
+    /// SCALE_OTHER_MINUS_LOCAL 6, SCALE_OTHER_MINUS_LOCAL_ADD_LOCAL (BLEND) 7,
+    /// SCALE_OTHER_MINUS_LOCAL_ADD_LOCAL_ALPHA 8, SCALE_MINUS_OTHER_ADD_LOCAL
+    /// (BLEND_LOCAL) 9, SCALE_MINUS_OTHER_ADD_LOCAL_ALPHA 0x10.
+    pub fn from_glide(code: i32) -> Self {
+        use CombineFunction::*;
+        match code {
+            0x0 => Zero,
+            0x1 => Local,
+            0x2 => LocalAlpha,
+            0x3 => ScaleOther,
+            0x4 => ScaleOtherAddLocal,
+            0x5 => ScaleOtherAddLocalAlpha,
+            0x6 => ScaleOtherMinusLocal,
+            0x7 => ScaleOtherMinusLocalAddLocal,
+            0x8 => ScaleOtherMinusLocalAddLocalAlpha,
+            0x9 => ScaleMinusOtherAddLocal,
+            0x10 => ScaleMinusOtherAddLocalAlpha,
+            _ => Zero,
+        }
+    }
+}
+
+impl CombineFactor {
+    /// `GR_COMBINE_FACTOR_*` per `glide.h`: ZERO 0, LOCAL 1, OTHER_ALPHA 2,
+    /// LOCAL_ALPHA 3, TEXTURE_ALPHA (DETAIL_FACTOR) 4, TEXTURE_RGB (LOD_FRACTION)
+    /// 5, ONE 8, ONE_MINUS_LOCAL 9, ONE_MINUS_OTHER_ALPHA 0xa,
+    /// ONE_MINUS_LOCAL_ALPHA 0xb, ONE_MINUS_TEXTURE_ALPHA 0xc,
+    /// ONE_MINUS_LOD_FRACTION 0xd.
+    pub fn from_glide(code: i32) -> Self {
+        use CombineFactor::*;
+        match code {
+            0x0 => Zero,
+            0x1 => Local,
+            0x2 => OtherAlpha,
+            0x3 => LocalAlpha,
+            0x4 => TextureAlpha,
+            0x5 => LodFraction,
+            0x8 => One,
+            0x9 => OneMinusLocal,
+            0xa => OneMinusOtherAlpha,
+            0xb => OneMinusLocalAlpha,
+            0xc => OneMinusTextureAlpha,
+            0xd => OneMinusLodFraction,
+            _ => Zero,
+        }
+    }
+}
+
+impl CombineLocal {
+    /// `GR_COMBINE_LOCAL_*`: ITERATED 0, CONSTANT 1 (NONE is its alias), DEPTH 2.
+    pub fn from_glide(code: i32) -> Self {
+        match code {
+            0x1 => CombineLocal::Constant,
+            0x2 => CombineLocal::Depth,
+            _ => CombineLocal::Iterated,
+        }
+    }
+}
+
+impl CombineOther {
+    /// `GR_COMBINE_OTHER_*`: ITERATED 0, TEXTURE 1, CONSTANT 2 (NONE is its alias).
+    pub fn from_glide(code: i32) -> Self {
+        match code {
+            0x1 => CombineOther::Texture,
+            0x2 => CombineOther::Constant,
+            _ => CombineOther::Iterated,
+        }
+    }
+}
+
 /// Texture internal formats (`GR_TEXFMT_*`).
 ///
 /// These are what games hand to `grTexDownloadMipMap`; the texture cache
@@ -266,6 +342,25 @@ pub fn resolution_to_size(code: u32) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combine_codes_match_glide_h() {
+        assert_eq!(
+            CombineFunction::from_glide(0x9),
+            CombineFunction::ScaleMinusOtherAddLocal
+        );
+        assert_eq!(
+            CombineFunction::from_glide(0x10),
+            CombineFunction::ScaleMinusOtherAddLocalAlpha
+        );
+        assert_eq!(
+            CombineFunction::from_glide(0x7),
+            CombineFunction::ScaleOtherMinusLocalAddLocal
+        );
+        assert_eq!(CombineLocal::from_glide(0x2), CombineLocal::Depth);
+        assert_eq!(CombineOther::from_glide(0x2), CombineOther::Constant);
+        assert_eq!(CombineFactor::from_glide(0x8), CombineFactor::One);
+    }
 
     #[test]
     fn blend_codes_match_glide_h() {

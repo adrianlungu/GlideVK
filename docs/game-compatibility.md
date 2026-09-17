@@ -211,6 +211,24 @@ regardless of draw order, and that a later draw wins with depth off. W is
 interpolated per vertex for now (exact for small primitives); moving it to
 the fragment shader is the follow-up if large walls show sorting errors.
 
+**Main menu without any text — `guColorCombineFunction` table, now from the
+SDK.** The menu's frames, bars and cursor drew but every label was missing.
+The menu-frame trace shows the glyph tiles (font textures decode fine, white
+glyphs with alpha) drawn with `TEXTURE_TIMES_CCRGB` (code 5) — Unreal's tile
+path modulates the texture by the *constant* colour, which holds the UI green.
+Our `guColorCombineFunction` handled four codes and let the rest fall through
+to modulate-by-iterated, and the iterated colour on tiles is black, so the text
+was drawn black. The helper is now the SDK's own table (`gu.c`: every
+`GrColorCombineFnc_t` as its `grColorCombine` expansion), same for
+`guAlphaSource`, verified against nGlide by `examples/wine_gucombine.c`. Found
+alongside and fixed per `glide.h`: `GR_COMBINE_FUNCTION` 0x9 / 0x10 are
+`SCALE_MINUS_OTHER_ADD_LOCAL[_ALPHA]` (`f*(-other)+local`), not minus-local;
+`GR_COMBINE_LOCAL_DEPTH` is 2; and `invert` inverts the combine unit's output
+(`GR_COLORCOMBINE_ONE` is an inverted ZERO), not the factor. The code→enum
+maps now live in core (`CombineFunction::from_glide` etc.) for both shells.
+nGlide renders the two DELTA0 codes black, contradicting the SDK's flat-shade
+semantics, so the harness skips them.
+
 **Blend factor codes — were permuted, now per `glide.h` and verified against
 nGlide.** `map_blend_factor` had 3/4/5/6 shuffled (ONE was 6, ONE_MINUS_SRC_ALPHA
 was 3) and its "verified by wine_blend" claim was circular: that harness used
@@ -275,8 +293,15 @@ bug above survived that. The fix is methodological:
   and defaults the reference to nGlide's `glide3x.dll` in the Deus Ex install.
   Both shells' `grLfbReadRegion` are real and share
   `Backend::read_region_rgb565`.
+- `wine_gucombine.c`: every `guColorCombineFunction` and `guAlphaSource` code
+  with texture, iterated and constant inputs chosen to be distinguishable.
 - `wine_wbuffer.c`: near-then-far and far-then-near quads under
   `GR_DEPTHBUFFER_WBUFFER` + `LEQUAL` with `ooz` left at 0, plus depth off.
+- Performance: with `GLIDEVK_LOG` on, a `perf` line every 120 frames gives
+  fps, draws and triangles per frame, and the CPU split between draw
+  submission and `grBufferSwap`. Scripted intro/menu runs: ~135 fps, ~800
+  draws/frame, ~5 ms submit + ~1 ms present. `GLIDEVK_TRACE_TIME=<a>..<b>`
+  (seconds) traces by wall time when the frame number is unpredictable.
 - Diagnostics that made the palette bug visible: `GLIDEVK_TRACE_FRAMES=<n>` or
   `<start>..<end>` logs every traced call (downloads, palette uploads, binds,
   draws with blend/depth state, clears, swaps) in order for those frames; `GLIDEVK_TEXDUMP=<dir>` writes each

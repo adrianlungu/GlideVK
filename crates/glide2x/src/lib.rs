@@ -29,10 +29,15 @@ static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0
 /// the log path; `GLIDEVK_LOG=1` uses the fixed absolute `C:\glidevk.log` (which
 /// Wine maps to `$WINEPREFIX/drive_c/glidevk.log`) so the location doesn't depend
 /// on the game's working directory. A no-op when unset.
+/// Whether `GLIDEVK_LOG` is set — cached, since this is consulted per draw.
+fn log_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GLIDEVK_LOG").is_some())
+}
+
 fn glidevk_log(msg: &str) {
     use std::io::Write;
-    use std::sync::OnceLock;
-    static T0: OnceLock<std::time::Instant> = OnceLock::new();
     let path = match std::env::var("GLIDEVK_LOG") {
         Ok(v) if v == "1" || v.is_empty() => "glidevk.log".to_string(), // game's cwd
         Ok(v) => v,                                                     // explicit path
@@ -40,10 +45,7 @@ fn glidevk_log(msg: &str) {
     };
     // Prefix with seconds since the first log line so lifecycle events
     // (re-opens, captures) can be placed against the game's own timeline.
-    let t = T0
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_secs_f32();
+    let t = log_elapsed();
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -72,6 +74,7 @@ fn log_once(flag: &AtomicBool, msg: &str) {
 fn trace_on() -> bool {
     use std::sync::OnceLock;
     static RANGE: OnceLock<(u32, u32)> = OnceLock::new();
+    static TIME: OnceLock<Option<(f32, f32)>> = OnceLock::new();
     let (start, end) = *RANGE.get_or_init(|| {
         let v = std::env::var("GLIDEVK_TRACE_FRAMES").unwrap_or_default();
         match v.split_once("..") {
@@ -80,7 +83,33 @@ fn trace_on() -> bool {
         }
     });
     let f = FRAME.load(Ordering::Relaxed);
-    f >= start && f < end
+    if f >= start && f < end {
+        return true;
+    }
+    // `GLIDEVK_TRACE_TIME=<start>..<end>` in seconds since the first log line,
+    // for when the frame number at the moment of interest is not predictable
+    // (e.g. after a key press that loads the menu).
+    let time = *TIME.get_or_init(|| {
+        let v = std::env::var("GLIDEVK_TRACE_TIME").ok()?;
+        let (a, b) = v.split_once("..")?;
+        Some((a.parse().ok()?, b.parse().ok()?))
+    });
+    match time {
+        Some((a, b)) => {
+            let t = log_elapsed();
+            t >= a && t < b
+        }
+        None => false,
+    }
+}
+
+/// Seconds since the first log line (the timestamp the log prefix shows).
+fn log_elapsed() -> f32 {
+    use std::sync::OnceLock;
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f32()
 }
 
 fn trace(msg: &str) {
@@ -92,7 +121,7 @@ fn trace(msg: &str) {
 fn log_distinct(key: u64, msg: &str) {
     use std::collections::HashSet;
     static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
-    if std::env::var_os("GLIDEVK_LOG").is_none() {
+    if !log_enabled() {
         return;
     }
     if let Ok(mut g) = SEEN.lock() {
@@ -143,7 +172,7 @@ fn log_texcoords(tris: &[DrawVertex], tex_size: [f32; 2], shade: &str) {
     use std::collections::HashSet;
     use std::hash::{Hash, Hasher};
     static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
-    if std::env::var_os("GLIDEVK_LOG").is_none() || tris.len() < 3 {
+    if !log_enabled() || tris.len() < 3 {
         return;
     }
     if TEXLOG_COUNT.load(Ordering::Relaxed) >= TEXLOG_MAX {
@@ -212,7 +241,7 @@ unsafe fn log_raw_vertex(base: *const u8, nverts: i32) {
     use std::collections::HashSet;
     use std::hash::{Hash, Hasher};
     static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
-    if std::env::var_os("GLIDEVK_LOG").is_none() {
+    if !log_enabled() {
         return;
     }
     if RAWLOG_COUNT.load(Ordering::Relaxed) >= RAWLOG_MAX {
@@ -445,10 +474,73 @@ fn bind_draw_texture(ctx: &mut Context) {
     }
 }
 
+/// Per-frame performance counters, reported every `PERF_EVERY` frames when
+/// logging is on: fps, draws and triangles per frame, and the split between
+/// CPU time spent in draw submission and time spent in `grBufferSwap` (which
+/// includes the GPU wait).
+struct Perf {
+    draws: u64,
+    tris: u64,
+    submit_ns: u64,
+    present_ns: u64,
+    frames: u32,
+    since: Option<std::time::Instant>,
+}
+static PERF: Mutex<Perf> = Mutex::new(Perf {
+    draws: 0,
+    tris: 0,
+    submit_ns: 0,
+    present_ns: 0,
+    frames: 0,
+    since: None,
+});
+const PERF_EVERY: u32 = 120;
+
+fn perf_draw(tris: u64, ns: u64) {
+    if let Ok(mut p) = PERF.lock() {
+        p.draws += 1;
+        p.tris += tris;
+        p.submit_ns += ns;
+    }
+}
+
+fn perf_frame(present_ns: u64) {
+    if !log_enabled() {
+        return;
+    }
+    let Ok(mut p) = PERF.lock() else {
+        return;
+    };
+    p.present_ns += present_ns;
+    p.frames += 1;
+    let since = *p.since.get_or_insert_with(std::time::Instant::now);
+    if p.frames >= PERF_EVERY {
+        let secs = since.elapsed().as_secs_f64().max(1e-6);
+        let f = p.frames as f64;
+        glidevk_log(&format!(
+            "perf fps={:.1} draws/frame={:.0} tris/frame={:.0} submit={:.2}ms/frame present={:.2}ms/frame",
+            f / secs,
+            p.draws as f64 / f,
+            p.tris as f64 / f,
+            p.submit_ns as f64 / f / 1e6,
+            p.present_ns as f64 / f / 1e6
+        ));
+        *p = Perf {
+            draws: 0,
+            tris: 0,
+            submit_ns: 0,
+            present_ns: 0,
+            frames: 0,
+            since: Some(std::time::Instant::now()),
+        };
+    }
+}
+
 fn submit_fan(verts: &[DrawVertex]) {
     if verts.len() < 3 {
         return;
     }
+    let t0 = std::time::Instant::now();
     let mut tris = Vec::with_capacity((verts.len() - 2) * 3);
     for i in 1..verts.len() - 1 {
         tris.extend_from_slice(&[verts[0], verts[i], verts[i + 1]]);
@@ -466,7 +558,7 @@ fn submit_fan(verts: &[DrawVertex]) {
             ctx.state.chroma_key[2],
         ];
         let (atf, atr) = (ctx.state.alpha_test_func, ctx.state.alpha_test_ref);
-        if std::env::var_os("GLIDEVK_LOG").is_some() {
+        if log_enabled() {
             shade = shade_desc(&ctx.state);
         }
         if trace_on() {
@@ -504,6 +596,7 @@ fn submit_fan(verts: &[DrawVertex]) {
             tex_size = b.current_tex_size();
         }
     });
+    perf_draw((tris.len() / 3) as u64, t0.elapsed().as_nanos() as u64);
     // Diagnostics only (GLIDEVK_LOG); file I/O deliberately outside the lock.
     log_texcoords(&tris, tex_size, &shade);
 }
@@ -710,6 +803,7 @@ pub extern "system" fn grBufferClear(color: u32, _alpha: u8, _depth: u32) {
 pub extern "system" fn grBufferSwap(_swap_interval: i32) {
     trace("grBufferSwap");
     FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
     let capture = with_ctx(|ctx| {
         if let Some(b) = ctx.backend.as_mut() {
             if b.present().is_err() {
@@ -721,6 +815,7 @@ pub extern "system" fn grBufferSwap(_swap_interval: i32) {
         }
     })
     .flatten();
+    perf_frame(t0.elapsed().as_nanos() as u64);
     // Write the captured frame outside the context lock (file I/O). For interval
     // capture the frame index is appended so a whole intro can be scanned.
     if let Some((frame, w, h, rgba)) = capture {
@@ -770,14 +865,7 @@ pub extern "system" fn grColorCombine(func: i32, factor: i32, local: i32, other:
             "grColorCombine func={func} factor={factor} local={local} other={other} inv={inv}"
         ),
     );
-    with_ctx(|ctx| {
-        let c = &mut ctx.state.color_combine;
-        c.function = map_combine_function(func);
-        c.factor = map_combine_factor(factor);
-        c.local = map_combine_local(local);
-        c.other = map_combine_other(other);
-        c.invert = inv != 0;
-    });
+    set_color_combine(func, factor, local, other, inv);
 }
 
 #[export_name = "grAlphaCombine"]
@@ -786,14 +874,7 @@ pub extern "system" fn grAlphaCombine(func: i32, factor: i32, local: i32, other:
         2 << 40 | (func as u64) << 24 | (factor as u64) << 16 | (local as u64) << 8 | other as u64,
         &format!("grAlphaCombine func={func} factor={factor} local={local} other={other}"),
     );
-    with_ctx(|ctx| {
-        let a = &mut ctx.state.alpha_combine;
-        a.function = map_combine_function(func);
-        a.factor = map_combine_factor(factor);
-        a.local = map_combine_local(local);
-        a.other = map_combine_other(other);
-        a.invert = inv != 0;
-    });
+    set_alpha_combine(func, factor, local, other, inv);
 }
 
 #[export_name = "grAlphaBlendFunction"]
@@ -872,84 +953,83 @@ pub extern "system" fn grFogMode(mode: i32) {
 // gu* high-level combine helpers (used by real Glide2 games)
 // ---------------------------------------------------------------------------
 
-/// `guColorCombineFunction(GrColorCombineFnc_t)` — map the high-level function
-/// to the low-level color combine state.
+fn set_color_combine(func: i32, factor: i32, local: i32, other: i32, inv: FxBool) {
+    with_ctx(|ctx| {
+        let c = &mut ctx.state.color_combine;
+        c.function = CombineFunction::from_glide(func);
+        c.factor = CombineFactor::from_glide(factor);
+        c.local = CombineLocal::from_glide(local);
+        c.other = CombineOther::from_glide(other);
+        c.invert = inv != 0;
+    });
+}
+
+fn set_alpha_combine(func: i32, factor: i32, local: i32, other: i32, inv: FxBool) {
+    with_ctx(|ctx| {
+        let a = &mut ctx.state.alpha_combine;
+        a.function = CombineFunction::from_glide(func);
+        a.factor = CombineFactor::from_glide(factor);
+        a.local = CombineLocal::from_glide(local);
+        a.other = CombineOther::from_glide(other);
+        a.invert = inv != 0;
+    });
+}
+
+/// `guColorCombineFunction(GrColorCombineFnc_t)`: the exact `grColorCombine`
+/// each code expands to in the 3dfx Glide 2.x SDK (`gu.c`), as
+/// (function, factor, local, other, invert) `GR_COMBINE_*` codes. The DELTA0
+/// variants (3, 7) additionally flat-shade from the first vertex on hardware;
+/// we treat them as their smooth counterparts. Verified against nGlide by
+/// `examples/wine_gucombine.c`, which walks every code (Deus Ex draws all its
+/// UI text with TEXTURE_TIMES_CCRGB, which used to fall through to modulate
+/// with the iterated colour — black text).
 #[export_name = "guColorCombineFunction"]
 pub extern "system" fn guColorCombineFunction(func: i32) {
     log_distinct(
         5 << 40 | func as u64,
         &format!("guColorCombineFunction func={func}"),
     );
-    use glidevk_core::types::{CombineFunction as F, CombineLocal as L, CombineOther as O};
-    with_ctx(|ctx| {
-        let c = &mut ctx.state.color_combine;
-        c.invert = false;
-        c.factor = CombineFactor::One;
-        match func {
-            2 => {
-                // ITRGB
-                c.function = F::Local;
-                c.local = L::Iterated;
-                c.other = O::Iterated;
-            }
-            4 => {
-                // DECAL_TEXTURE
-                c.function = F::ScaleOther;
-                c.other = O::Texture;
-            }
-            6 => {
-                // TEXTURE_TIMES_ITRGB (modulate)
-                c.function = F::ScaleOther;
-                c.factor = CombineFactor::Local;
-                c.local = L::Iterated;
-                c.other = O::Texture;
-            }
-            1 => {
-                // CCRGB (constant)
-                c.function = F::Local;
-                c.local = L::Constant;
-            }
-            _ => {
-                // Sensible default: modulate.
-                c.function = F::ScaleOther;
-                c.factor = CombineFactor::Local;
-                c.local = L::Iterated;
-                c.other = O::Texture;
-            }
-        }
-    });
+    // Function: ZERO 0, LOCAL 1, SCALE_OTHER 3, SCALE_OTHER_ADD_LOCAL 4,
+    // SCALE_OTHER_ADD_LOCAL_ALPHA 5, SCALE_OTHER_MINUS_LOCAL 6, BLEND 7.
+    // Factor: NONE 0, LOCAL 1, LOCAL_ALPHA 3, TEXTURE_ALPHA 4, ONE 8.
+    // Local: ITERATED 0, CONSTANT (= NONE) 1. Other: ITERATED 0, TEXTURE 1,
+    // CONSTANT (= NONE) 2.
+    let (f, fac, loc, oth, inv) = match func {
+        0x0 => (0, 0, 1, 2, 0),  // ZERO
+        0x1 => (1, 0, 1, 2, 0),  // CCRGB
+        0x2 => (1, 0, 0, 2, 0),  // ITRGB
+        0x3 => (1, 0, 0, 2, 0),  // ITRGB_DELTA0
+        0x4 => (3, 8, 1, 1, 0),  // DECAL_TEXTURE
+        0x5 => (3, 1, 1, 1, 0),  // TEXTURE_TIMES_CCRGB
+        0x6 => (3, 1, 0, 1, 0),  // TEXTURE_TIMES_ITRGB
+        0x7 => (3, 1, 0, 1, 0),  // TEXTURE_TIMES_ITRGB_DELTA0
+        0x8 => (5, 1, 0, 1, 0),  // TEXTURE_TIMES_ITRGB_ADD_ALPHA
+        0x9 => (3, 3, 1, 1, 0),  // TEXTURE_TIMES_ALPHA
+        0xa => (4, 3, 0, 1, 0),  // TEXTURE_TIMES_ALPHA_ADD_ITRGB
+        0xb => (4, 8, 0, 1, 0),  // TEXTURE_ADD_ITRGB
+        0xc => (6, 8, 0, 1, 0),  // TEXTURE_SUB_ITRGB
+        0xd => (7, 4, 1, 0, 0),  // CCRGB_BLEND_ITRGB_ON_TEXALPHA
+        0xe => (4, 3, 0, 1, 0),  // DIFF_SPEC_A
+        0xf => (5, 1, 0, 1, 0),  // DIFF_SPEC_B
+        0x10 => (0, 0, 1, 2, 1), // ONE (inverted zero)
+        _ => (3, 1, 0, 1, 0),    // unknown: modulate
+    };
+    set_color_combine(f, fac, loc, oth, inv);
 }
 
-/// `guAlphaSource(GrAlphaSource_t)` — configure the alpha combine source.
+/// `guAlphaSource(GrAlphaSource_t)`: the SDK's `grAlphaCombine` expansions.
+/// CC_ALPHA 0, ITERATED_ALPHA 1, TEXTURE_ALPHA 2,
+/// TEXTURE_ALPHA_TIMES_ITERATED_ALPHA 3.
 #[export_name = "guAlphaSource"]
 pub extern "system" fn guAlphaSource(src: i32) {
     log_distinct(6 << 40 | src as u64, &format!("guAlphaSource src={src}"));
-    use glidevk_core::types::{CombineFunction as F, CombineLocal as L, CombineOther as O};
-    with_ctx(|ctx| {
-        let a = &mut ctx.state.alpha_combine;
-        a.invert = false;
-        a.factor = CombineFactor::One;
-        match src {
-            0 => {
-                a.function = F::Local;
-                a.local = L::Constant;
-            } // CC_ALPHA
-            1 => {
-                a.function = F::Local;
-                a.local = L::Iterated;
-            } // ITERATED_ALPHA
-            2 => {
-                a.function = F::ScaleOther;
-                a.other = O::Texture;
-            } // TEXTURE_ALPHA
-            _ => {
-                a.function = F::ScaleOther;
-                a.factor = CombineFactor::Local;
-                a.local = L::Iterated;
-                a.other = O::Texture;
-            } // TEXTURE*ITER
-        }
-    });
+    let (f, fac, loc, oth) = match src {
+        0 => (1, 0, 1, 2),
+        1 => (1, 0, 0, 2),
+        2 => (3, 8, 1, 1),
+        _ => (3, 1, 0, 1),
+    };
+    set_alpha_combine(f, fac, loc, oth, 0);
 }
 
 /// `guFogTableIndexToW(int i)` -> float. Fog-table build helper; approximate.
@@ -1145,7 +1225,7 @@ fn log_texture_content(addr: u32, format: u32, w: u32, h: u32, rgba: &[u8], raw:
     static SEEN: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
     static DUMPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     const DUMP_MAX: u32 = 400;
-    if std::env::var_os("GLIDEVK_LOG").is_none() || rgba.len() < 4 {
+    if !log_enabled() || rgba.len() < 4 {
         return;
     }
     // Unreal's texture cache reuses TMU addresses, so key on the content too
@@ -1303,6 +1383,7 @@ pub unsafe extern "system" fn grDrawTriangle(
     b: *const core::ffi::c_void,
     c: *const core::ffi::c_void,
 ) {
+    let t0 = std::time::Instant::now();
     log_raw_vertex(a as *const u8, 3);
     let mut tris = [
         read_vertex(a as *const u8),
@@ -1322,7 +1403,7 @@ pub unsafe extern "system" fn grDrawTriangle(
             ctx.state.chroma_key[2],
         ];
         let (atf, atr) = (ctx.state.alpha_test_func, ctx.state.alpha_test_ref);
-        if std::env::var_os("GLIDEVK_LOG").is_some() {
+        if log_enabled() {
             shade = shade_desc(&ctx.state);
         }
         apply_depth_mode(ctx.state.depth_mode, &mut tris);
@@ -1338,6 +1419,7 @@ pub unsafe extern "system" fn grDrawTriangle(
             tex_size = bk.current_tex_size();
         }
     });
+    perf_draw(1, t0.elapsed().as_nanos() as u64);
     log_texcoords(&tris, tex_size, &shade);
 }
 
@@ -1471,63 +1553,6 @@ pub extern "system" fn grLfbWriteRegion(
 // ---------------------------------------------------------------------------
 // GR_* -> core enum maps (values shared with Glide3)
 // ---------------------------------------------------------------------------
-
-fn map_combine_function(v: i32) -> CombineFunction {
-    use CombineFunction::*;
-    match v {
-        0x0 => Zero,
-        0x1 => Local,
-        0x2 => LocalAlpha,
-        0x3 => ScaleOther,
-        0x4 => ScaleOtherAddLocal,
-        0x5 => ScaleOtherAddLocalAlpha,
-        0x6 => ScaleOtherMinusLocal,
-        0x7 => ScaleOtherMinusLocalAddLocal,
-        0x8 => ScaleOtherMinusLocalAddLocalAlpha,
-        0x9 => ScaleMinusLocalAddLocal,
-        0xa => ScaleMinusLocalAddLocalAlpha,
-        _ => Zero,
-    }
-}
-
-fn map_combine_factor(v: i32) -> CombineFactor {
-    use CombineFactor::*;
-    match v {
-        0x0 => Zero,
-        0x1 => Local,
-        0x2 => OtherAlpha,
-        0x3 => LocalAlpha,
-        0x4 => TextureAlpha,
-        0x8 => One,
-        0x9 => OneMinusLocal,
-        0xa => OneMinusOtherAlpha,
-        0xb => OneMinusLocalAlpha,
-        0xc => OneMinusTextureAlpha,
-        _ => Zero,
-    }
-}
-
-fn map_combine_local(v: i32) -> CombineLocal {
-    use CombineLocal::*;
-    match v {
-        0x0 => Iterated,
-        0x1 => Constant,
-        0x2 => None,
-        0x3 => Depth,
-        _ => Iterated,
-    }
-}
-
-fn map_combine_other(v: i32) -> CombineOther {
-    use CombineOther::*;
-    match v {
-        0x0 => Iterated,
-        0x1 => Texture,
-        0x2 => Constant,
-        0x3 => None,
-        _ => Iterated,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Accepted-but-minimal entry points (state stored elsewhere or not yet used)

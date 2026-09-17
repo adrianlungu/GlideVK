@@ -96,7 +96,6 @@ vec3 factorColor(vec3 cLoc, float aLoc, float aOth, vec4 t) {
     else if (f == 10) v = vec3(1.0 - aLoc);    // ONE_MINUS_LOCAL_ALPHA
     else if (f == 11) v = vec3(1.0 - t.a);     // ONE_MINUS_TEXTURE_ALPHA
     else v = vec3(1.0);                        // DETAIL/LOD: TODO, treat as 1
-    if (pc.cInvert != 0) v = vec3(1.0) - v;
     return v;
 }
 float factorAlpha(float aLoc, float aOth, vec4 t) {
@@ -113,7 +112,6 @@ float factorAlpha(float aLoc, float aOth, vec4 t) {
     else if (f == 10) v = 1.0 - aLoc;
     else if (f == 11) v = 1.0 - t.a;
     else v = 1.0;
-    if (pc.aInvert != 0) v = 1.0 - v;
     return v;
 }
 
@@ -129,8 +127,8 @@ vec3 funcColor(vec3 f, vec3 loc, vec3 oth, float aLoc) {
     if (fn == 6) return f * (oth - loc);                 // SCALE_OTHER_MINUS_LOCAL
     if (fn == 7) return f * (oth - loc) + loc;           // + LOCAL
     if (fn == 8) return f * (oth - loc) + vec3(aLoc);    // + LOCAL_ALPHA
-    if (fn == 9) return f * (-loc) + loc;                // SCALE_MINUS_LOCAL_ADD_LOCAL
-    if (fn == 10) return f * (-loc) + vec3(aLoc);        // + LOCAL_ALPHA
+    if (fn == 9) return f * (-oth) + loc;                // SCALE_MINUS_OTHER_ADD_LOCAL
+    if (fn == 10) return f * (-oth) + vec3(aLoc);        // + LOCAL_ALPHA
     return vec3(0.0);
 }
 float funcAlpha(float f, float loc, float oth) {
@@ -144,8 +142,8 @@ float funcAlpha(float f, float loc, float oth) {
     if (fn == 6) return f * (oth - loc);
     if (fn == 7) return f * (oth - loc) + loc;
     if (fn == 8) return f * (oth - loc) + loc;
-    if (fn == 9) return f * (-loc) + loc;
-    if (fn == 10) return f * (-loc) + loc;
+    if (fn == 9) return f * (-oth) + loc;
+    if (fn == 10) return f * (-oth) + loc;
     return 0.0;
 }
 
@@ -175,9 +173,13 @@ void main() {
 
     vec3 cf = factorColor(cLoc, aLoc, aOth, t);
     vec3 rgb = funcColor(cf, cLoc, cOth, aLoc);
+    // `invert` inverts the combine unit's OUTPUT (GR_COLORCOMBINE_ONE is an
+    // inverted ZERO), not the factor.
+    if (pc.cInvert != 0) rgb = vec3(1.0) - rgb;
 
     float af = factorAlpha(aLoc, aOth, t);
     float a = funcAlpha(af, aLoc, aOth);
+    if (pc.aInvert != 0) a = 1.0 - a;
 
     // Alpha test (GR_CMP_*): discard fragments that fail the comparison.
     int f = pc.alphaTestFunc;

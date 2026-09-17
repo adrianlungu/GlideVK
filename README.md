@@ -6,15 +6,16 @@ drop-in `glide3x.dll` / `glide2x.dll` that translate Glide calls **directly** to
 Vulkan under Wine — no Direct3D or OpenGL hop.
 
 > Status: **P3 in progress — real games.** `glide2x.dll` + `glide3x.dll`
-> shells over a shared core. Deus Ex (Unreal, glide2x) boots and plays its
-> whole intro with GlideVK: the Eidos and Ion Storm logos, the flying title and
-> the lit metallic emblem all render (see
+> shells over a shared core. Deus Ex (Unreal, glide2x) boots, plays its
+> whole intro and shows its main menu with GlideVK: the Eidos and Ion Storm
+> logos, the flying title, the lit metallic emblem and the menu text all render (see
 > [`docs/game-compatibility.md`](docs/game-compatibility.md)). Behaviour is
 > checked **against a reference Glide DLL** (nGlide) with
-> `examples/run_diff.sh`, which found four root causes in a row: Glide's s/t
+> `examples/run_diff.sh`, which found five root causes in a row: Glide's s/t
 > span `[0,256)` on the major axis, not texels; the blend-factor table was
-> permuted; palettes apply at draw time, not bind time; and W-buffer depth
-> comes from `oow`, not `ooz`. The Wine smoke
+> permuted; palettes apply at draw time, not bind time; W-buffer depth
+> comes from `oow`, not `ooz`; and the `gu` combine helpers must expand
+> exactly as the SDK's `gu.c` does. The Wine smoke
 > tests (`examples/run_wine_probe.sh [32|64]`) still pass on the 32-bit ship
 > target.
 
