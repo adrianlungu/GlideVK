@@ -4,13 +4,13 @@
 # render a real Unreal-engine game. Non-destructive: originals are backed up.
 #
 #   examples/deusex_glidevk.sh install   # swap in GlideVK + Glide renderer
-#   examples/deusex_glidevk.sh run        # launch in a Wine virtual desktop
+#   examples/deusex_glidevk.sh run        # launch the game in its prefix
 #   examples/deusex_glidevk.sh restore    # put the originals back
 #
-# The 'run' target launches inside a Wine VIRTUAL DESKTOP. This is important:
-# Unreal 1 crashes on focus loss (alt-tab / screenshot -> WM_KILLFOCUS ->
-# EndFullscreen asserts a null RenDev — an engine bug, not the wrapper). Inside a
-# virtual desktop the game window keeps focus, so alt-tab/screenshots don't crash.
+# 'run' launches the game directly in its prefix. GLIDEVK_* variables are passed
+# through, e.g. GLIDEVK_LOG=/tmp/glidevk.log for the trace (with a 'perf' line
+# every 120 frames) or GLIDEVK_CAPTURE=/tmp/frame.ppm GLIDEVK_CAPTURE_FRAME=-100
+# for periodic frame dumps.
 set -euo pipefail
 SYS="/media/games/Games/gog/deus-ex/drive_c/GOG Games/Deus Ex GOTY/System"
 PREFIX="/media/games/Games/gog/deus-ex"
@@ -29,10 +29,9 @@ case "${1:-}" in
     # any focus loss, with real Glide drivers too. With SoftDrv the game drops to
     # software while minimized and re-enters Glide fullscreen on restore.
     sed -i 's/^GameRenderDevice=.*/GameRenderDevice=GlideDrv.GlideRenderDevice/; s/^WindowedRenderDevice=.*/WindowedRenderDevice=SoftDrv.SoftwareRenderDevice/' "$SYS/DeusEx.ini"
-    # `install windowed` runs the game WINDOWED (StartupFullscreen=False). This is
-    # the proper fix for the Unreal-1 alt-tab/focus-loss crash (an engine bug:
-    # WM_KILLFOCUS -> EndFullscreen asserts a null RenDev) and, unlike a Wine
-    # virtual desktop, it also works under Proton. Fullscreen otherwise.
+    # `install windowed` sets StartupFullscreen=False, which with GlideDrv
+    # (fullscreen-only) means the game starts on its software renderer; the
+    # default (fullscreen) is what GlideVK renders.
     if [ "${2:-}" = "windowed" ]; then
         sed -i 's/^StartupFullscreen=.*/StartupFullscreen=False/' "$SYS/DeusEx.ini"
     else
@@ -48,9 +47,10 @@ case "${1:-}" in
     # A crash leaves it behind, so the next launch shows the "safe mode" dialog.
     # Clear it so we always boot straight into the game.
     rm -f "$SYS/Running.ini"
-    # Virtual desktop at the game's resolution avoids the Unreal focus-loss crash.
     cd "$SYS"
-    exec env WINEPREFIX="$PREFIX" wine explorer /desktop=deusex,960x720 DeusEx.exe
+    # Wine paths for the GLIDEVK_* file variables: a Linux absolute path works
+    # as-is under Wine's Z: drive mapping.
+    exec env WINEPREFIX="$PREFIX" WINEDEBUG="${WINEDEBUG:--all}" wine DeusEx.exe
     ;;
   restore)
     [ -f "$SYS/glide2x.dll.glidevk-orig" ] && cp "$SYS/glide2x.dll.glidevk-orig" "$SYS/glide2x.dll"

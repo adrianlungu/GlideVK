@@ -23,6 +23,6 @@ echo ">> building harnesses ($CC)"
 
 cd "$OUT"                                # so wine finds glide3x.dll beside the exe
 echo ">> headless probe"
-WINEDEBUG=${WINEDEBUG:--all} wine ./wine_probe.exe
+GLIDEVK_WINDOWED=1 WINEDEBUG=${WINEDEBUG:--all} wine ./wine_probe.exe
 echo ">> windowed present (needs a display)"
-WINEDEBUG=${WINEDEBUG:--all} wine ./wine_window.exe
+GLIDEVK_WINDOWED=1 WINEDEBUG=${WINEDEBUG:--all} wine ./wine_window.exe

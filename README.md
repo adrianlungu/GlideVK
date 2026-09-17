@@ -8,7 +8,9 @@ Vulkan under Wine — no Direct3D or OpenGL hop.
 > Status: **P3 in progress — real games.** `glide2x.dll` + `glide3x.dll`
 > shells over a shared core. Deus Ex (Unreal, glide2x) boots, plays its
 > whole intro and shows its main menu with GlideVK: the Eidos and Ion Storm
-> logos, the flying title, the lit metallic emblem and the menu text all render (see
+> logos, the flying title, the lit metallic emblem and the menu text all render,
+> and in-game resolution changes switch the (Wine-emulated) display mode like
+> a 3dfx driver did (see
 > [`docs/game-compatibility.md`](docs/game-compatibility.md)). Behaviour is
 > checked **against a reference Glide DLL** (nGlide) with
 > `examples/run_diff.sh`, which found five root causes in a row: Glide's s/t

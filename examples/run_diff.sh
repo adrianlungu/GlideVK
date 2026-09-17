@@ -42,7 +42,7 @@ for h in "${@:-wine_texcoord}"; do
     "$CC" -O2 -o "$DIFF/$h.exe" "examples/$h.c" -lgdi32
     for side in ref ours; do
         cp "$DIFF/$h.exe" "$DIFF/$side/"
-        ( cd "$DIFF/$side" && WINEDEBUG="${WINEDEBUG:--all}" timeout 60 wine "./$h.exe" ) \
+        ( cd "$DIFF/$side" && GLIDEVK_WINDOWED=1 WINEDEBUG="${WINEDEBUG:--all}" timeout 60 wine "./$h.exe" ) \
             > "$DIFF/$h.$side.txt" 2>"$DIFF/$h.$side.err" || echo "!! $h ($side) exited $?" >&2
     done
     if diff -u "$DIFF/$h.ref.txt" "$DIFF/$h.ours.txt" > "$DIFF/$h.diff"; then

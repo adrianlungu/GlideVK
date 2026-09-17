@@ -1402,6 +1402,24 @@ impl Backend {
         if self.current_image.is_some() {
             return Ok(());
         }
+        // Follow the window: games resize it after grSstWinOpen (Unreal moves
+        // it to the Glide resolution) and Wine does not always report a size
+        // change as OUT_OF_DATE, so compare the surface extent ourselves.
+        if let Some(sc) = self.swapchain.as_ref() {
+            // SAFETY: valid physical device and surface owned by `sc`.
+            let caps = unsafe {
+                sc.surface_loader
+                    .get_physical_device_surface_capabilities(self.physical, sc.surface)?
+            };
+            let cur = caps.current_extent;
+            if cur.width != u32::MAX
+                && cur.width > 0
+                && cur.height > 0
+                && (cur.width != sc.extent.width || cur.height != sc.extent.height)
+            {
+                self.recreate_swapchain()?;
+            }
+        }
         let index;
         let sc = self.swapchain.as_ref().unwrap();
         // SAFETY: owned handles; single-frame-in-flight enforced by the fence.

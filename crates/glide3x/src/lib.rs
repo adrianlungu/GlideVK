@@ -138,6 +138,15 @@ pub extern "system" fn grSstWinOpen(
     #[cfg(windows)]
     {
         let (w, h) = resolution_to_size(screen_resolution);
+        // Glide is fullscreen-only: switch the display like a 3dfx driver did
+        // (Wine emulates it by scaling the window); GR_RESOLUTION_NONE (0xff)
+        // means "use the window" and GLIDEVK_WINDOWED=1 opts out.
+        if screen_resolution != ScreenResolution::None as u32
+            && std::env::var_os("GLIDEVK_WINDOWED").is_none()
+            && glidevk_core::win32::set_display_mode(w, h).is_ok()
+        {
+            glidevk_core::win32::make_fullscreen_window(hwnd as isize, w, h);
+        }
         // SAFETY: GetModuleHandleW(NULL) returns this process's base HINSTANCE.
         let hinstance = unsafe { GetModuleHandleW(core::ptr::null()) };
         match glidevk_core::vk::Backend::new_windowed(hwnd as isize, hinstance, w, h) {
@@ -165,6 +174,10 @@ extern "system" {
 pub extern "system" fn grSstWinClose(_context: GrContext) -> FxBool {
     if let Ok(mut g) = CONTEXT.lock() {
         *g = None;
+    }
+    #[cfg(windows)]
+    if std::env::var_os("GLIDEVK_WINDOWED").is_none() {
+        glidevk_core::win32::restore_display_mode();
     }
     1
 }

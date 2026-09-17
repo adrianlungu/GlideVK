@@ -211,6 +211,25 @@ regardless of draw order, and that a later draw wins with depth off. W is
 interpolated per vertex for now (exact for small primitives); moving it to
 the fragment shader is the follow-up if large walls show sorting errors.
 
+**Resolution changes and fullscreen did nothing — Glide is a fullscreen API,
+now honoured.** On 3dfx hardware `grSstWinOpen` switched the display to the
+requested mode; Unreal then sizes its window from `grSstScreenWidth/Height`,
+except that Deus Ex never actually resizes it, so with GlideVK a request for
+800x600 rendered into the untouched 640x480 window, and a 1600x1200 pick from
+the Display Settings menu just relaid the UI for a viewport four times the
+window. nGlide gets all of this from Direct3D fullscreen. GlideVK now does the
+equivalent itself (`glidevk-core::win32`): `grSstWinOpen` calls
+`ChangeDisplaySettingsExW(CDS_FULLSCREEN)` for the Glide resolution and makes
+the game window a borderless popup of that size at the origin; `grSstWinClose`
+restores the desktop mode. Wine emulates the mode switch by scaling the
+fullscreen window and its mouse input to the monitor, which is what makes
+"fullscreen" and in-game resolution changes work. The swapchain now follows
+the window's surface extent every frame instead of waiting for an
+out-of-date error Wine does not always raise. `GLIDEVK_WINDOWED=1` keeps the
+desktop mode and renders into the window as-is (the harness runners set it).
+Note that toggling *off* fullscreen in the game still means Unreal's software
+renderer: GlideDrv is fullscreen-only by design, as on real hardware.
+
 **Main menu without any text — `guColorCombineFunction` table, now from the
 SDK.** The menu's frames, bars and cursor drew but every label was missing.
 The menu-frame trace shows the glyph tiles (font textures decode fine, white
@@ -258,6 +277,10 @@ re-init. The `GLIDEVK_CAPTURE=<file.ppm>` frame dump makes these debuggable
 offline.
 
 ## Launch notes
+- Deus Ex: `examples/deusex_glidevk.sh install` then `run` (direct launch in
+  the prefix; the Wine virtual desktop it used to need is gone). Set
+  `GLIDEVK_LOG`, `GLIDEVK_CAPTURE`, `GLIDEVK_TEXDUMP`, `GLIDEVK_TRACE_FRAMES`
+  / `GLIDEVK_TRACE_TIME`, `GLIDEVK_WINDOWED` in the environment as needed.
 - D2's prefix is a **win32** prefix — needs a 32-bit-capable wine
   (`wine-10.8-staging-i386` in the Lutris runners), not a WoW64-only build.
 - Force Glide with `-3dfx` (Lutris's default launch does not).

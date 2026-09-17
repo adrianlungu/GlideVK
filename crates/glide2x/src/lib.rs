@@ -29,6 +29,36 @@ static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0
 /// the log path; `GLIDEVK_LOG=1` uses the fixed absolute `C:\glidevk.log` (which
 /// Wine maps to `$WINEPREFIX/drive_c/glidevk.log`) so the location doesn't depend
 /// on the game's working directory. A no-op when unset.
+/// `GLIDEVK_WINDOWED=1`: keep the desktop mode and render into the game's
+/// window as-is instead of switching the display to the Glide resolution.
+#[cfg(windows)]
+fn windowed() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GLIDEVK_WINDOWED").is_some())
+}
+
+/// Glide is fullscreen-only: switch the display to the requested mode like a
+/// 3dfx driver did. Under Wine this is emulated by scaling the fullscreen
+/// window and its mouse input, which is what makes resolution changes and
+/// "fullscreen" work. Unreal sizes its window to `grSstScreenWidth/Height`
+/// right after `grSstWinOpen`, so the window then covers the (emulated) screen.
+#[cfg(windows)]
+fn enter_display_mode(hwnd: usize, w: u32, h: u32) {
+    if windowed() {
+        return;
+    }
+    match glidevk_core::win32::set_display_mode(w, h) {
+        Ok(()) => {
+            glidevk_core::win32::make_fullscreen_window(hwnd as isize, w, h);
+            glidevk_log(&format!("display mode {w}x{h} set, window sized to match"));
+        }
+        Err(code) => glidevk_log(&format!(
+            "display mode {w}x{h} FAILED (DISP_CHANGE {code}); staying windowed"
+        )),
+    }
+}
+
 /// Whether `GLIDEVK_LOG` is set — cached, since this is consulted per draw.
 fn log_enabled() -> bool {
     use std::sync::OnceLock;
@@ -689,6 +719,8 @@ pub extern "system" fn grSstWinOpen(
             glidevk_log(&format!(
                 "grSstWinOpen: reusing persistent backend (re-open) hwnd={hwnd:#x} res={screen_resolution} -> {w}x{h}"
             ));
+            #[cfg(windows)]
+            enter_display_mode(hwnd, w, h);
             return 1;
         }
     }
@@ -703,6 +735,7 @@ pub extern "system" fn grSstWinOpen(
         glidevk_log(&format!(
             "grSstWinOpen: hwnd={hwnd:#x} res={screen_resolution} cformat={_color_format} -> {w}x{h} (0=ARGB 1=ABGR 2=RGBA 3=BGRA)"
         ));
+        enter_display_mode(hwnd, w, h);
         // The window may not be fully mapped the instant Glide is initialized;
         // retry briefly so a transient surface/swapchain failure doesn't abort
         // the whole render-device init ("3d hardware initialization failed").
@@ -760,6 +793,12 @@ extern "system" {
 #[export_name = "grSstWinClose"]
 pub extern "system" fn grSstWinClose() {
     glidevk_log("grSstWinClose");
+    // Give the desktop back (Unreal closes on focus loss and drops to its
+    // windowed software renderer until the window is restored).
+    #[cfg(windows)]
+    if !windowed() {
+        glidevk_core::win32::restore_display_mode();
+    }
     // Keep the backend alive across Unreal's close/re-open focus-loss dance
     // (see grSstWinOpen / grGlideShutdown). Full teardown here crashed alt-tab.
 }

@@ -23,6 +23,7 @@ pub mod pipeline;
 pub mod state;
 pub mod texture;
 pub mod types;
+pub mod win32;
 
 #[cfg(feature = "vulkan")]
 pub mod vk;
