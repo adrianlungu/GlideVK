@@ -37,6 +37,35 @@ pub enum DepthMode {
     WBuffer,
 }
 
+/// Largest W the Glide W-buffer represents (`GR_WDEPTHVALUE_FARTHEST`); the
+/// Z-buffer likewise spans `ooz` in 0..65535.
+pub const GLIDE_DEPTH_RANGE: f32 = 65535.0;
+
+impl DepthMode {
+    /// Normalised [0,1] depth for a vertex, smaller = nearer (so `GR_CMP_LESS`
+    /// / `LEQUAL` keep their Glide meaning).
+    ///
+    /// * W-buffer: from `oow = 1/w` — `w / 65535`. Games like Unreal never set
+    ///   `ooz`, so using it here would put everything at the same depth and let
+    ///   later draws overwrite nearer ones (Deus Ex's Ion Storm glow covering
+    ///   its text). A non-positive or non-finite `oow` is treated as farthest.
+    /// * Z-buffer: from `ooz` (65535/z, larger = nearer).
+    /// * Disabled: farthest; the test is off anyway.
+    pub fn vertex_depth(self, ooz: f32, oow: f32) -> f32 {
+        match self {
+            DepthMode::WBuffer => {
+                if oow.is_finite() && oow > 0.0 {
+                    ((1.0 / oow) / GLIDE_DEPTH_RANGE).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                }
+            }
+            DepthMode::ZBuffer => (1.0 - ooz / GLIDE_DEPTH_RANGE).clamp(0.0, 1.0),
+            DepthMode::Disable => 1.0,
+        }
+    }
+}
+
 /// The full Glide render state for a context.
 #[derive(Clone, Debug)]
 pub struct State {
@@ -163,5 +192,23 @@ impl State {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.pipeline_key().hash(&mut h);
         h.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wbuffer_depth_comes_from_oow_and_nearer_is_smaller() {
+        let m = DepthMode::WBuffer;
+        let near = m.vertex_depth(0.0, 1.0 / 100.0); // w = 100
+        let far = m.vertex_depth(0.0, 1.0 / 1000.0); // w = 1000
+        assert!(near < far);
+        assert_eq!(m.vertex_depth(0.0, 0.0), 1.0); // unset -> farthest
+        assert_eq!(m.vertex_depth(0.0, f32::NAN), 1.0);
+        // Z-buffer uses ooz, larger = nearer.
+        let z = DepthMode::ZBuffer;
+        assert!(z.vertex_depth(60000.0, 0.0) < z.vertex_depth(100.0, 0.0));
     }
 }

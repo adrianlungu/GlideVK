@@ -16,6 +16,7 @@
 
 use std::sync::Mutex;
 
+use glidevk_core::state::DepthMode;
 use glidevk_core::types::*;
 use glidevk_core::vk::{BlendConfig, CombineParams, DepthConfig, DrawVertex};
 use glidevk_core::Context;
@@ -64,19 +65,22 @@ fn log_once(flag: &AtomicBool, msg: &str) {
 
 /// Log `msg` the first time this exact `key` is seen — for enumerating all the
 /// distinct render-state configurations a game uses without per-call spam.
-/// `GLIDEVK_TRACE_FRAMES=<n>`: log every call to the traced entry points for
-/// the first `n` frames, in order, so call sequencing (texture download vs
-/// palette vs bind vs draw) can be read directly.
+/// `GLIDEVK_TRACE_FRAMES=<n>` or `<start>..<end>`: log every call to the traced
+/// entry points for frames `[0, n)` or `[start, end)`, in order, so call
+/// sequencing (texture download vs palette vs bind vs draw) can be read
+/// directly.
 fn trace_on() -> bool {
     use std::sync::OnceLock;
-    static LIMIT: OnceLock<u32> = OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        std::env::var("GLIDEVK_TRACE_FRAMES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
+    static RANGE: OnceLock<(u32, u32)> = OnceLock::new();
+    let (start, end) = *RANGE.get_or_init(|| {
+        let v = std::env::var("GLIDEVK_TRACE_FRAMES").unwrap_or_default();
+        match v.split_once("..") {
+            Some((a, b)) => (a.parse().unwrap_or(0), b.parse().unwrap_or(0)),
+            None => (0, v.parse().unwrap_or(0)),
+        }
     });
-    limit > 0 && FRAME.load(Ordering::Relaxed) < limit
+    let f = FRAME.load(Ordering::Relaxed);
+    f >= start && f < end
 }
 
 fn trace(msg: &str) {
@@ -361,8 +365,9 @@ unsafe fn read_vertex(base: *const u8) -> DrawVertex {
         ],
         // sow/tow (= s/w, t/w) + oow (= 1/w); the shader recovers + normalizes.
         tex: [f32_at(base, V_SOW0), f32_at(base, V_TOW0)],
-        // TODO: proper Glide2 Z/W-buffer range mapping.
-        depth: (1.0 - ooz / 65535.0).clamp(0.0, 1.0),
+        // Provisional Z-buffer depth from `ooz`; `apply_depth_mode` replaces it
+        // from `oow` when the game runs a W-buffer (Unreal never sets `ooz`).
+        depth: DepthMode::ZBuffer.vertex_depth(ooz, 0.0),
         // Perspective W (1/w) for the texture divide. In single-texture Glide the
         // vertex `oow` and `tmuvtx[0].oow` are the *same* perspective 1/w — but
         // Deus Ex's GlideDrv leaves `tmuvtx[0].oow` **uninitialized** for its draws.
@@ -389,6 +394,18 @@ unsafe fn read_vertex(base: *const u8) -> DrawVertex {
                 1.0
             }
         },
+    }
+}
+
+/// Give each vertex the depth the active `grDepthBufferMode` implies (see
+/// `DepthMode::vertex_depth`). W is interpolated per vertex, which is exact
+/// for small primitives and close enough for the rest until depth moves to the
+/// fragment shader.
+fn apply_depth_mode(mode: DepthMode, tris: &mut [DrawVertex]) {
+    if mode == DepthMode::WBuffer {
+        for v in tris.iter_mut() {
+            v.depth = mode.vertex_depth(0.0, v.oow);
+        }
     }
 }
 
@@ -432,19 +449,6 @@ fn submit_fan(verts: &[DrawVertex]) {
     if verts.len() < 3 {
         return;
     }
-    if trace_on() {
-        let v = &verts[0];
-        trace(&format!(
-            "draw n={} tex={:#x} v0=({:.0},{:.0}) rgb=({:.0},{:.0},{:.0})",
-            verts.len(),
-            LAST_TEX_ADDR.load(Ordering::Relaxed),
-            v.pos[0],
-            v.pos[1],
-            v.color[0] * 255.0,
-            v.color[1] * 255.0,
-            v.color[2] * 255.0
-        ));
-    }
     let mut tris = Vec::with_capacity((verts.len() - 2) * 3);
     for i in 1..verts.len() - 1 {
         tris.extend_from_slice(&[verts[0], verts[i], verts[i + 1]]);
@@ -465,6 +469,29 @@ fn submit_fan(verts: &[DrawVertex]) {
         if std::env::var_os("GLIDEVK_LOG").is_some() {
             shade = shade_desc(&ctx.state);
         }
+        if trace_on() {
+            let v = &verts[0];
+            let (mut zmin, mut zmax) = (f32::MAX, f32::MIN);
+            for v in verts {
+                zmin = zmin.min(v.depth);
+                zmax = zmax.max(v.depth);
+            }
+            trace(&format!(
+                "draw n={} tex={:#x} v0=({:.0},{:.0}) rgb=({:.0},{:.0},{:.0}) a={:.0} depth={zmin:.4}..{zmax:.4} dmode={:?} dwrite={} dcmp={} {shade}",
+                verts.len(),
+                LAST_TEX_ADDR.load(Ordering::Relaxed),
+                v.pos[0],
+                v.pos[1],
+                v.color[0] * 255.0,
+                v.color[1] * 255.0,
+                v.color[2] * 255.0,
+                v.color[3] * 255.0,
+                ctx.state.depth_mode,
+                ctx.state.depth_write,
+                ctx.state.depth_compare
+            ));
+        }
+        apply_depth_mode(ctx.state.depth_mode, &mut tris);
         bind_draw_texture(ctx);
         if let Some(b) = ctx.backend.as_mut() {
             b.set_combine(combine);
@@ -797,10 +824,10 @@ pub extern "system" fn grConstantColorValue(color: u32) {
 pub extern "system" fn grDepthBufferMode(mode: i32) {
     with_ctx(|ctx| {
         ctx.state.depth_mode = match mode {
-            0 => glidevk_core::state::DepthMode::Disable,
-            1 => glidevk_core::state::DepthMode::ZBuffer,
-            2 => glidevk_core::state::DepthMode::WBuffer,
-            _ => glidevk_core::state::DepthMode::Disable,
+            0 => DepthMode::Disable,
+            1 => DepthMode::ZBuffer,
+            2 => DepthMode::WBuffer,
+            _ => DepthMode::Disable,
         };
     });
 }
@@ -1277,7 +1304,7 @@ pub unsafe extern "system" fn grDrawTriangle(
     c: *const core::ffi::c_void,
 ) {
     log_raw_vertex(a as *const u8, 3);
-    let tris = [
+    let mut tris = [
         read_vertex(a as *const u8),
         read_vertex(b as *const u8),
         read_vertex(c as *const u8),
@@ -1298,6 +1325,7 @@ pub unsafe extern "system" fn grDrawTriangle(
         if std::env::var_os("GLIDEVK_LOG").is_some() {
             shade = shade_desc(&ctx.state);
         }
+        apply_depth_mode(ctx.state.depth_mode, &mut tris);
         bind_draw_texture(ctx);
         if let Some(bk) = ctx.backend.as_mut() {
             bk.set_combine(combine);

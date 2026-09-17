@@ -196,6 +196,21 @@ e.g. `GLIDEVK_GAMMA=3.0` makes the emblem arcs and orb clearly visible (verified
 against a normal-vs-boosted capture). It's the practical way to match a reference
 renderer's brightness without hard-coding a value.
 
+**Ion Storm text hidden by its glow — W-buffer depth, now fixed.** With
+blending right, the "ION STORM" letters vanished behind the green glow. The
+call trace (`GLIDEVK_TRACE_FRAMES=1100..1400`) shows the game draws the letter
+meshes first and the glow *after* them, opaque, with depth writes on and
+`GR_CMP_LEQUAL` — on hardware the depth test rejects the glow where the letters
+are nearer. Every draw of ours had depth 1.0: depth came from the vertex `ooz`
+field, which Unreal never sets, while the game runs
+`grDepthBufferMode(GR_DEPTHBUFFER_WBUFFER)`, where depth is `w = 1/oow`.
+`DepthMode::vertex_depth` (core) now derives depth from `oow` in W-buffer
+mode (`w / 65535`, nearer = smaller) and from `ooz` in Z-buffer mode;
+`examples/wine_wbuffer.c` confirms against nGlide that the nearer quad wins
+regardless of draw order, and that a later draw wins with depth off. W is
+interpolated per vertex for now (exact for small primitives); moving it to
+the fragment shader is the follow-up if large walls show sorting errors.
+
 **Blend factor codes — were permuted, now per `glide.h` and verified against
 nGlide.** `map_blend_factor` had 3/4/5/6 shuffled (ONE was 6, ONE_MINUS_SRC_ALPHA
 was 3) and its "verified by wine_blend" claim was circular: that harness used
@@ -260,9 +275,11 @@ bug above survived that. The fix is methodological:
   and defaults the reference to nGlide's `glide3x.dll` in the Deus Ex install.
   Both shells' `grLfbReadRegion` are real and share
   `Backend::read_region_rgb565`.
-- Diagnostics that made the palette bug visible: `GLIDEVK_TRACE_FRAMES=<n>`
-  logs every traced call (downloads, palette uploads, binds, draws, clears,
-  swaps) in order for the first n frames; `GLIDEVK_TEXDUMP=<dir>` writes each
+- `wine_wbuffer.c`: near-then-far and far-then-near quads under
+  `GR_DEPTHBUFFER_WBUFFER` + `LEQUAL` with `ooz` left at 0, plus depth off.
+- Diagnostics that made the palette bug visible: `GLIDEVK_TRACE_FRAMES=<n>` or
+  `<start>..<end>` logs every traced call (downloads, palette uploads, binds,
+  draws with blend/depth state, clears, swaps) in order for those frames; `GLIDEVK_TEXDUMP=<dir>` writes each
   distinct uploaded texture, and each P8 variant, as a PPM.
 
 When something in a game looks wrong, the order is: reproduce the exact Glide
