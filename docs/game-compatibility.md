@@ -211,6 +211,27 @@ regardless of draw order, and that a later draw wins with depth off. W is
 interpolated per vertex for now (exact for small primitives); moving it to
 the fragment shader is the follow-up if large walls show sorting errors.
 
+**Frame rate collapsed with resolution (~2 fps at 1600x1200, ~7 at
+800x600) — the frame-capture diagnostic was on for every frame.** The capture
+setting defaulted to `-1`, and negative values mean "every |n| frames", so with
+no `GLIDEVK_CAPTURE` at all each present copied the whole image to host memory
+and converted every pixel on the CPU — reading from write-combined, uncached
+memory, which is what made it so slow and resolution-dependent. It went
+unnoticed because every scripted test run set `GLIDEVK_CAPTURE`, which
+replaced the default with a sparse interval: those runs showed ~140 fps while
+real sessions crawled. Fixes: a `CaptureMode` enum (`Off` by default, pinned by
+a test); readback buffers allocated from `HOST_CACHED` memory; the per-frame
+copy is now GPU-only, and the CPU converts just the pixels a
+`grLfbReadRegion` asks for, or the full frame on a requested capture frame.
+The capture buffer also now follows swapchain growth — it was sized once, so
+a larger mode chosen in-game overran it on the GPU and the host read past its
+mapping. Measured without any diagnostic flags: 144 fps (the monitor's
+refresh cap) at 1600x1200 and 800x600, fullscreen or `GLIDEVK_WINDOWED`, with
+the per-frame copy costing ~0.3 ms at 1600x1200. Testing note: launching the
+game again while the previous instance is still exiting makes it quit before
+loading the renderer (empty `DeusEx.log`, crash marker left behind); wait for
+`wineserver -w` between scripted runs.
+
 **Resolution changes and fullscreen did nothing — Glide is a fullscreen API,
 now honoured.** On 3dfx hardware `grSstWinOpen` switched the display to the
 requested mode; Unreal then sizes its window from `grSstScreenWidth/Height`,
@@ -322,9 +343,8 @@ bug above survived that. The fix is methodological:
   `GR_DEPTHBUFFER_WBUFFER` + `LEQUAL` with `ooz` left at 0, plus depth off.
 - Performance: with `GLIDEVK_LOG` on, a `perf` line every 120 frames gives
   fps, draws and triangles per frame, and the CPU split between draw
-  submission and `grBufferSwap`. Scripted intro/menu runs: ~135 fps, ~800
-  draws/frame, ~5 ms submit + ~1 ms present. `GLIDEVK_TRACE_TIME=<a>..<b>`
-  (seconds) traces by wall time when the frame number is unpredictable.
+  submission and `grBufferSwap`. `GLIDEVK_TRACE_TIME=<a>..<b>` (seconds)
+  traces by wall time when the frame number is unpredictable.
 - Diagnostics that made the palette bug visible: `GLIDEVK_TRACE_FRAMES=<n>` or
   `<start>..<end>` logs every traced call (downloads, palette uploads, binds,
   draws with blend/depth state, clears, swaps) in order for those frames; `GLIDEVK_TEXDUMP=<dir>` writes each

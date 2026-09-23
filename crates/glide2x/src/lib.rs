@@ -768,7 +768,7 @@ pub extern "system" fn grSstWinOpen(
                         .ok()
                         .and_then(|s| s.parse().ok())
                         .unwrap_or(400);
-                    backend.set_capture_frame(frame);
+                    backend.set_capture(glidevk_core::vk::CaptureMode::from_frame_arg(frame));
                 }
                 ctx.backend = Some(backend);
             }
@@ -1541,10 +1541,11 @@ pub extern "system" fn grLfbUnlock(_lock_type: u32, _buffer: u32) -> FxBool {
 /// `grLfbReadRegion`: copy a rectangle of the framebuffer to caller memory as
 /// 16-bit RGB565 (the only format Glide 2 reads back in).
 ///
-/// Reads come from the **last presented frame**: the first call enables the
-/// per-frame host copy, so a read made before any frame has been presented
-/// with readback on returns zeros. Coordinates are in the game's logical space
-/// and scaled to the swapchain extent when the two differ.
+/// Reads come from the **last presented frame** (the front buffer), which the
+/// backend keeps a GPU-side copy of every frame; only the requested pixels are
+/// converted. Before the first present the region reads as zeros. Coordinates
+/// are in the game's logical space and scaled to the swapchain extent when the
+/// two differ.
 ///
 /// # Safety
 /// `dst_data` must point to at least `src_h * dst_stride` writable bytes.
@@ -1568,7 +1569,7 @@ pub unsafe extern "system" fn grLfbReadRegion(
             return 0;
         };
         if !b.read_region_rgb565(src_x, src_y, src_w, src_h, dst_stride, dst) {
-            glidevk_log("grLfbReadRegion: no frame presented since readback enabled");
+            glidevk_log("grLfbReadRegion: nothing presented yet, returning zeros");
         }
         1
     })

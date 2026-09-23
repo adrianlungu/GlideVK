@@ -257,6 +257,41 @@ struct Swapchain {
     framebuffers: Vec<vk::Framebuffer>,
 }
 
+/// When the backend copies a presented frame to the host for
+/// [`Backend::take_capture`] (the `GLIDEVK_CAPTURE` diagnostic).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// No capture. Must stay the default: a capture costs a full-image copy to
+    /// host memory, a GPU wait and a per-pixel CPU conversion every time.
+    #[default]
+    Off,
+    /// Only this frame.
+    Frame(u32),
+    /// Every n-th frame.
+    Every(u32),
+}
+
+impl CaptureMode {
+    /// Decode a `GLIDEVK_CAPTURE_FRAME` value: `n > 0` captures frame `n`,
+    /// `n < 0` every `|n|` frames, `0` nothing.
+    pub fn from_frame_arg(n: i32) -> Self {
+        match n {
+            0 => CaptureMode::Off,
+            n if n > 0 => CaptureMode::Frame(n as u32),
+            n => CaptureMode::Every(n.unsigned_abs()),
+        }
+    }
+
+    /// Whether frame `frame` is captured.
+    pub fn wants(self, frame: u32) -> bool {
+        match self {
+            CaptureMode::Off => false,
+            CaptureMode::Frame(n) => frame == n,
+            CaptureMode::Every(n) => frame > 0 && frame.is_multiple_of(n),
+        }
+    }
+}
+
 /// A Vulkan device bound to one Glide context.
 pub struct Backend {
     _entry: ash::Entry,
@@ -359,14 +394,16 @@ pub struct Backend {
     capture_buffer: vk::Buffer,
     capture_memory: vk::DeviceMemory,
     capture_mapped: *mut u8,
-    capture_frame: i32,
+    /// Size of `capture_buffer` in bytes; a full-image copy is only recorded
+    /// when the image fits, so a stale buffer can never be overrun.
+    capture_bytes: u64,
+    capture: CaptureMode,
     frame_num: u32,
     last_capture: Option<(u32, u32, u32, Vec<u8>)>, // (frame, w, h, rgba)
-    /// Copy every presented frame to the host (for `grLfbReadRegion` / read
-    /// locks). Off until a game asks to read the framebuffer.
-    full_readback: bool,
-    /// The most recent presented frame as RGBA8, when `full_readback` is on.
-    last_frame: Option<(u32, u32, Vec<u8>)>, // (w, h, rgba)
+    /// Size of the frame `capture_buffer` currently holds: every presented
+    /// frame is copied there on the GPU (cheap), so a framebuffer read always
+    /// sees the front buffer. The CPU only touches it for a read or a capture.
+    capture_extent: Option<(u32, u32)>,
 
     swapchain: Option<Swapchain>,
 
@@ -501,6 +538,7 @@ impl Backend {
                 physical,
                 VERTEX_CAPACITY_BYTES,
                 vk::BufferUsageFlags::VERTEX_BUFFER,
+                HostAccess::Upload,
             )?
         };
         let (readback_buffer, readback_memory, readback_mapped) = unsafe {
@@ -510,6 +548,7 @@ impl Backend {
                 physical,
                 4,
                 vk::BufferUsageFlags::TRANSFER_DST,
+                HostAccess::Readback,
             )?
         };
 
@@ -591,6 +630,7 @@ impl Backend {
                 physical,
                 lfb_bytes,
                 vk::BufferUsageFlags::TRANSFER_SRC,
+                HostAccess::Upload,
             )?
         };
         let (capture_buffer, capture_memory, capture_mapped) = unsafe {
@@ -600,6 +640,7 @@ impl Backend {
                 physical,
                 lfb_bytes,
                 vk::BufferUsageFlags::TRANSFER_DST,
+                HostAccess::Readback,
             )?
         };
 
@@ -663,11 +704,11 @@ impl Backend {
             capture_buffer,
             capture_memory,
             capture_mapped,
-            capture_frame: -1,
+            capture_bytes: lfb_bytes,
+            capture: CaptureMode::Off,
             frame_num: 0,
             last_capture: None,
-            full_readback: false,
-            last_frame: None,
+            capture_extent: None,
             swapchain,
             pending_clear: [0.0, 0.0, 0.0, 1.0],
             y_sign: 1.0,
@@ -1107,10 +1148,30 @@ impl Backend {
                 self.physical,
                 need,
                 vk::BufferUsageFlags::TRANSFER_SRC,
+                HostAccess::Upload,
             )?;
             self.lfb_staging = b;
             self.lfb_staging_memory = m;
             self.lfb_staging_mapped = p;
+
+            // The capture buffer receives full-image copies: it must follow the
+            // swapchain too, or a larger mode overruns it on the GPU and the
+            // host read past its mapping.
+            self.device.destroy_buffer(self.capture_buffer, None);
+            self.device.free_memory(self.capture_memory, None);
+            let (b, m, p) = create_mapped_buffer(
+                &self.instance,
+                &self.device,
+                self.physical,
+                need,
+                vk::BufferUsageFlags::TRANSFER_DST,
+                HostAccess::Readback,
+            )?;
+            self.capture_buffer = b;
+            self.capture_memory = m;
+            self.capture_mapped = p;
+            self.capture_bytes = need;
+            self.capture_extent = None;
         }
         self.swapchain = Some(sc);
         self.current_image = None;
@@ -1219,13 +1280,12 @@ impl Backend {
                 &[region],
             );
 
-            // On the capture frame, copy the whole image to the host buffer too.
-            // capture_frame > 0: that single frame. < 0: every |capture_frame|.
-            let capturing = (self.capture_frame > 0 && self.frame_num as i32 == self.capture_frame)
-                || (self.capture_frame < 0
-                    && self.frame_num > 0
-                    && self.frame_num.is_multiple_of(-self.capture_frame as u32));
-            let copy_full = capturing || self.full_readback;
+            // Copy the whole image to the host buffer every frame (a GPU-side
+            // copy, no CPU work) so framebuffer reads see the front buffer from
+            // the very first call — only if it fits the buffer.
+            let capturing = self.capture.wants(self.frame_num);
+            let image_bytes = extent.width as u64 * extent.height as u64 * 4;
+            let copy_full = image_bytes <= self.capture_bytes;
             if copy_full {
                 let full = vk::BufferImageCopy {
                     buffer_offset: 0,
@@ -1314,7 +1374,9 @@ impl Backend {
             let px = std::slice::from_raw_parts(self.readback_mapped, 4);
             self.last_center_pixel = [px[2], px[1], px[0], px[3]];
 
-            if copy_full {
+            self.capture_extent = copy_full.then_some((extent.width, extent.height));
+            // Full-frame CPU conversion only on a requested capture frame.
+            if copy_full && capturing {
                 let (w, h) = (extent.width as usize, extent.height as usize);
                 let src = std::slice::from_raw_parts(self.capture_mapped, w * h * 4);
                 let mut rgba = vec![0u8; w * h * 4];
@@ -1325,20 +1387,17 @@ impl Backend {
                     rgba[i * 4 + 2] = src[i * 4];
                     rgba[i * 4 + 3] = 255;
                 }
-                if capturing {
-                    self.last_capture =
-                        Some((self.frame_num, extent.width, extent.height, rgba.clone()));
-                }
-                self.last_frame = Some((extent.width, extent.height, rgba));
+                self.last_capture = Some((self.frame_num, extent.width, extent.height, rgba));
             }
         }
         self.frame_num += 1;
         Ok(())
     }
 
-    /// Request that frame `n` be copied to the host for [`Backend::take_capture`].
-    pub fn set_capture_frame(&mut self, n: i32) {
-        self.capture_frame = n;
+    /// Choose which presented frames are copied to the host for
+    /// [`Backend::take_capture`].
+    pub fn set_capture(&mut self, mode: CaptureMode) {
+        self.capture = mode;
     }
 
     /// Take the last captured frame (frame index, width, height, RGBA8), if any.
@@ -1346,25 +1405,11 @@ impl Backend {
         self.last_capture.take()
     }
 
-    /// Keep a host copy of every presented frame so [`Backend::last_frame`]
-    /// can serve framebuffer reads (`grLfbReadRegion`, read locks).
-    pub fn set_full_readback(&mut self, on: bool) {
-        self.full_readback = on;
-    }
-
-    /// The most recently presented frame (width, height, RGBA8), available once
-    /// full readback is on and a frame has been presented since.
-    pub fn last_frame(&self) -> Option<(u32, u32, &[u8])> {
-        self.last_frame
-            .as_ref()
-            .map(|(w, h, px)| (*w, *h, px.as_slice()))
-    }
-
-    /// `grLfbReadRegion`: copy a rectangle of the last presented frame into
-    /// `dst` as RGB565 rows of `dst_stride` bytes. Coordinates are in the
-    /// game's logical space and scaled to the frame's extent. The first call
-    /// enables per-frame readback, so until a frame has been presented since,
-    /// the region is zero-filled; returns whether frame data was available.
+    /// `grLfbReadRegion`: copy a rectangle of the front buffer (the last
+    /// presented frame) into `dst` as RGB565 rows of `dst_stride` bytes.
+    /// Coordinates are in the game's logical space and scaled to the frame's
+    /// extent. Only the requested pixels are read from the host buffer. Before
+    /// the first present the region is zero-filled and this returns false.
     pub fn read_region_rgb565(
         &mut self,
         x: u32,
@@ -1374,18 +1419,22 @@ impl Backend {
         dst_stride: u32,
         dst: &mut [u8],
     ) -> bool {
-        self.set_full_readback(true);
         let (lw, lh) = self.logical_size();
-        let Some((fw, fh, rgba)) = self.last_frame() else {
+        let Some((fw, fh)) = self.capture_extent else {
             dst.fill(0);
             return false;
         };
+        // SAFETY: `capture_extent` is only set after the frame's fence signalled
+        // and when the image fitted `capture_bytes`, the mapping's size.
+        let bgra =
+            unsafe { std::slice::from_raw_parts(self.capture_mapped, (fw * fh * 4) as usize) };
         for row in 0..h {
             let fy = ((y + row) * fh / lh.max(1)).min(fh - 1) as usize;
             for col in 0..w {
                 let fx = ((x + col) * fw / lw.max(1)).min(fw - 1) as usize;
                 let i = (fy * fw as usize + fx) * 4;
-                let px = crate::lfb::pack_rgb565(rgba[i], rgba[i + 1], rgba[i + 2]);
+                // Swapchain bytes are B,G,R,A.
+                let px = crate::lfb::pack_rgb565(bgra[i + 2], bgra[i + 1], bgra[i]);
                 let o = (row * dst_stride + col * 2) as usize;
                 if o + 2 <= dst.len() {
                     dst[o..o + 2].copy_from_slice(&px.to_le_bytes());
@@ -2000,6 +2049,18 @@ unsafe fn load_shader(device: &ash::Device, bytes: &[u8]) -> Result<vk::ShaderMo
     Ok(device.create_shader_module(&info, None)?)
 }
 
+/// How the CPU uses a mapped buffer, which decides its memory type.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostAccess {
+    /// CPU writes, GPU reads (vertices, uploads): any coherent host memory,
+    /// which on desktop drivers is write-combined — fast to write, very slow
+    /// to read back.
+    Upload,
+    /// GPU writes, CPU reads (readbacks): prefer HOST_CACHED so CPU reads run
+    /// at memory speed instead of uncached PCIe/write-combined speed.
+    Readback,
+}
+
 /// Allocate a host-visible, coherent buffer and leave it persistently mapped.
 unsafe fn create_mapped_buffer(
     instance: &ash::Instance,
@@ -2007,6 +2068,7 @@ unsafe fn create_mapped_buffer(
     physical: vk::PhysicalDevice,
     size: u64,
     usage: vk::BufferUsageFlags,
+    access: HostAccess,
 ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), Error> {
     let info = vk::BufferCreateInfo::default()
         .size(size)
@@ -2015,13 +2077,19 @@ unsafe fn create_mapped_buffer(
     let buffer = device.create_buffer(&info, None)?;
     let req = device.get_buffer_memory_requirements(buffer);
     let props = instance.get_physical_device_memory_properties(physical);
-    let mem_type = (0..props.memory_type_count)
-        .find(|&i| {
+    let base = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let find = |want: vk::MemoryPropertyFlags| {
+        (0..props.memory_type_count).find(|&i| {
             (req.memory_type_bits & (1 << i)) != 0
-                && props.memory_types[i as usize].property_flags.contains(
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                )
+                && props.memory_types[i as usize].property_flags.contains(want)
         })
+    };
+    let preferred = match access {
+        HostAccess::Readback => find(base | vk::MemoryPropertyFlags::HOST_CACHED),
+        HostAccess::Upload => None,
+    };
+    let mem_type = preferred
+        .or_else(|| find(base))
         .ok_or(Error::NoMemoryType)?;
     let alloc = vk::MemoryAllocateInfo::default()
         .allocation_size(req.size)
@@ -2226,6 +2294,7 @@ unsafe fn create_gpu_texture(
         physical,
         staging_size.max(4),
         vk::BufferUsageFlags::TRANSFER_SRC,
+        HostAccess::Upload,
     )?;
     let n = rgba.len().min(staging_size as usize);
     std::ptr::copy_nonoverlapping(rgba.as_ptr(), staging_ptr, n);
@@ -2358,6 +2427,19 @@ unsafe fn create_gpu_texture(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_is_off_by_default_and_decodes_the_frame_argument() {
+        // The default must never capture: it used to be -1 = "every frame",
+        // which copied and converted the whole image on every present.
+        let off = CaptureMode::default();
+        assert!((0..1000).all(|f| !off.wants(f)));
+        assert_eq!(CaptureMode::from_frame_arg(0), CaptureMode::Off);
+        let one = CaptureMode::from_frame_arg(400);
+        assert!(one.wants(400) && !one.wants(399) && !one.wants(800));
+        let every = CaptureMode::from_frame_arg(-100);
+        assert!(every.wants(100) && every.wants(200) && !every.wants(150) && !every.wants(0));
+    }
 
     /// Exercises the non-surface Vulkan path against the host ICD. Skips (rather
     /// than fails) when no loader/device is present, so CI without a GPU stays
