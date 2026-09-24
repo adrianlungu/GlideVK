@@ -242,6 +242,10 @@ struct GpuTexture {
     descriptor_clamp: vk::DescriptorSet,
     width: u32,
     height: u32,
+    /// Frame this texture was last bound in. A re-upload may only overwrite
+    /// the image in place when it was not bound in the frame being recorded;
+    /// earlier frames are already complete (their fence is waited on).
+    used_frame: u32,
 }
 
 /// Surface + swapchain + per-image render targets.
@@ -574,6 +578,7 @@ impl Backend {
                 1,
                 1,
                 &[255, 255, 255, 255],
+                0,
             )?
         };
         let current_desc = default_texture.descriptor;
@@ -892,6 +897,39 @@ impl Backend {
         height: u32,
         rgba: &[u8],
     ) -> Result<(), Error> {
+        // Re-upload of the same texture at the same size: overwrite the image
+        // in place. Games re-download constantly (Unreal refreshes lightmaps
+        // every frame), and making a new image + descriptors each time both
+        // costs milliseconds and used to exhaust the descriptor pool. Only safe
+        // when the texture is not already bound in the frame being recorded;
+        // earlier frames have completed (their fence is waited on at present).
+        let frame = self.frame_num;
+        if let Some(existing) = self.textures.get(&addr) {
+            if existing.width == width && existing.height == height && existing.used_frame != frame
+            {
+                let image = existing.image;
+                // SAFETY: owned handles; the image is in SHADER_READ_ONLY and
+                // unreferenced by the in-progress frame.
+                unsafe {
+                    upload_image_pixels(
+                        &self.instance,
+                        &self.device,
+                        self.physical,
+                        self.command_pool,
+                        self.queue,
+                        image,
+                        width,
+                        height,
+                        rgba,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    )?;
+                }
+                if let Some(t) = self.textures.get_mut(&addr) {
+                    t.used_frame = frame;
+                }
+                return Ok(());
+            }
+        }
         // SAFETY: all handles are owned by `self` and valid.
         let tex = unsafe {
             create_gpu_texture(
@@ -907,6 +945,7 @@ impl Backend {
                 width,
                 height,
                 rgba,
+                frame,
             )?
         };
         if let Some(old) = self.textures.insert(addr, tex) {
@@ -929,8 +968,10 @@ impl Backend {
     }
 
     pub fn set_texture(&mut self, addr: u64) -> bool {
-        match self.textures.get(&addr) {
+        let frame = self.frame_num;
+        match self.textures.get_mut(&addr) {
             Some(t) => {
+                t.used_frame = frame;
                 self.current_desc = t.descriptor;
                 self.current_desc_clamp = t.descriptor_clamp;
                 self.current_tex_size = [t.width as f32, t.height as f32];
@@ -1073,6 +1114,10 @@ impl Backend {
     /// Destroy a GPU texture's resources (not its descriptor set, which returns
     /// to the pool on pool reset/destroy).
     unsafe fn destroy_texture(&self, tex: &GpuTexture) {
+        // The pool is created with FREE_DESCRIPTOR_SET so these go back to it.
+        let _ = self
+            .device
+            .free_descriptor_sets(self.desc_pool, &[tex.descriptor, tex.descriptor_clamp]);
         self.device.destroy_image_view(tex.view, None);
         self.device.destroy_image(tex.image, None);
         self.device.free_memory(tex.memory, None);
@@ -2234,59 +2279,42 @@ unsafe fn create_desc_pool(device: &ash::Device) -> Result<vk::DescriptorPool, E
         .descriptor_count(MAX_TEXTURES * 2);
     let sizes = [size];
     let info = vk::DescriptorPoolCreateInfo::default()
+        // Sets are freed with their texture; without this the pool runs dry
+        // after a few thousand uploads and every later upload fails.
+        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
         .max_sets(MAX_TEXTURES * 2)
         .pool_sizes(&sizes);
     Ok(device.create_descriptor_pool(&info, None)?)
 }
 
-/// Upload an RGBA8 texture to a device-local image and build its descriptor set.
+/// Copy `rgba` into `image` through a staging buffer, leaving it in
+/// SHADER_READ_ONLY_OPTIMAL. `old_layout` is UNDEFINED for a fresh image or
+/// SHADER_READ_ONLY_OPTIMAL when overwriting one already in use.
 #[allow(clippy::too_many_arguments)]
-unsafe fn create_gpu_texture(
+unsafe fn upload_image_pixels(
     instance: &ash::Instance,
     device: &ash::Device,
     physical: vk::PhysicalDevice,
     command_pool: vk::CommandPool,
     queue: vk::Queue,
-    sampler: vk::Sampler,
-    sampler_clamp: vk::Sampler,
-    desc_pool: vk::DescriptorPool,
-    desc_set_layout: vk::DescriptorSetLayout,
+    image: vk::Image,
     width: u32,
     height: u32,
     rgba: &[u8],
-) -> Result<GpuTexture, Error> {
-    let format = vk::Format::R8G8B8A8_UNORM;
+    old_layout: vk::ImageLayout,
+) -> Result<(), Error> {
     let extent = vk::Extent3D {
         width,
         height,
         depth: 1,
     };
-    let image_info = vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .format(format)
-        .extent(extent)
-        .mip_levels(1)
-        .array_layers(1)
-        .samples(vk::SampleCountFlags::TYPE_1)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .initial_layout(vk::ImageLayout::UNDEFINED);
-    let image = device.create_image(&image_info, None)?;
-    let req = device.get_image_memory_requirements(image);
-    let mem_type = find_memory_type(
-        instance,
-        physical,
-        req.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
-    let alloc = vk::MemoryAllocateInfo::default()
-        .allocation_size(req.size)
-        .memory_type_index(mem_type);
-    let memory = device.allocate_memory(&alloc, None)?;
-    device.bind_image_memory(image, memory, 0)?;
-
-    // Staging upload.
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
     let staging_size = (width as u64) * (height as u64) * 4;
     let (staging, staging_mem, staging_ptr) = create_mapped_buffer(
         instance,
@@ -2299,28 +2327,30 @@ unsafe fn create_gpu_texture(
     let n = rgba.len().min(staging_size as usize);
     std::ptr::copy_nonoverlapping(rgba.as_ptr(), staging_ptr, n);
 
-    // One-time transfer: UNDEFINED -> TRANSFER_DST -> copy -> SHADER_READ_ONLY.
     let cmd = device.allocate_command_buffers(
         &vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1),
     )?[0];
-    let range = vk::ImageSubresourceRange {
-        aspect_mask: vk::ImageAspectFlags::COLOR,
-        base_mip_level: 0,
-        level_count: 1,
-        base_array_layer: 0,
-        layer_count: 1,
-    };
     device.begin_command_buffer(
         cmd,
         &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
     )?;
+    let src_access = if old_layout == vk::ImageLayout::UNDEFINED {
+        vk::AccessFlags::empty()
+    } else {
+        vk::AccessFlags::SHADER_READ
+    };
+    let src_stage = if old_layout == vk::ImageLayout::UNDEFINED {
+        vk::PipelineStageFlags::TOP_OF_PIPE
+    } else {
+        vk::PipelineStageFlags::FRAGMENT_SHADER
+    };
     let to_dst = vk::ImageMemoryBarrier::default()
-        .src_access_mask(vk::AccessFlags::empty())
+        .src_access_mask(src_access)
         .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        .old_layout(vk::ImageLayout::UNDEFINED)
+        .old_layout(old_layout)
         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -2328,7 +2358,7 @@ unsafe fn create_gpu_texture(
         .subresource_range(range);
     device.cmd_pipeline_barrier(
         cmd,
-        vk::PipelineStageFlags::TOP_OF_PIPE,
+        src_stage,
         vk::PipelineStageFlags::TRANSFER,
         vk::DependencyFlags::empty(),
         &[],
@@ -2381,6 +2411,77 @@ unsafe fn create_gpu_texture(
     device.free_command_buffers(command_pool, &cmds);
     device.destroy_buffer(staging, None);
     device.free_memory(staging_mem, None);
+    Ok(())
+}
+
+/// Upload an RGBA8 texture to a device-local image and build its descriptor set.
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_gpu_texture(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    physical: vk::PhysicalDevice,
+    command_pool: vk::CommandPool,
+    queue: vk::Queue,
+    sampler: vk::Sampler,
+    sampler_clamp: vk::Sampler,
+    desc_pool: vk::DescriptorPool,
+    desc_set_layout: vk::DescriptorSetLayout,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+    used_frame: u32,
+) -> Result<GpuTexture, Error> {
+    let format = vk::Format::R8G8B8A8_UNORM;
+    let extent = vk::Extent3D {
+        width,
+        height,
+        depth: 1,
+    };
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(extent)
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let image = device.create_image(&image_info, None)?;
+    let req = device.get_image_memory_requirements(image);
+    let mem_type = find_memory_type(
+        instance,
+        physical,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+    let alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(req.size)
+        .memory_type_index(mem_type);
+    let memory = device.allocate_memory(&alloc, None)?;
+    device.bind_image_memory(image, memory, 0)?;
+
+    upload_image_pixels(
+        instance,
+        device,
+        physical,
+        command_pool,
+        queue,
+        image,
+        width,
+        height,
+        rgba,
+        vk::ImageLayout::UNDEFINED,
+    )?;
+
+    let range = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
 
     // View + descriptor set.
     let view_info = vk::ImageViewCreateInfo::default()
@@ -2421,6 +2522,7 @@ unsafe fn create_gpu_texture(
         descriptor_clamp,
         width,
         height,
+        used_frame,
     })
 }
 

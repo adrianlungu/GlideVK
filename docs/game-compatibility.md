@@ -211,6 +211,28 @@ regardless of draw order, and that a later draw wins with depth off. W is
 interpolated per vertex for now (exact for small primitives); moving it to
 the fragment shader is the follow-up if large walls show sorting errors.
 
+**In-game objects untextured, and 14-40 fps — the descriptor pool ran dry.**
+Loading a save showed the world textured but many surfaces flat-shaded (they
+were the 1x1 white fallback tinted by the level light). Instrumenting the
+binds showed up to 275 texture binds per frame finding nothing at their
+address, across 1094 distinct addresses — every one of which had been
+downloaded moments earlier. Cause: each `upload_texture` created a fresh
+image plus **two descriptor sets** (REPEAT + CLAMP), the pool was created
+without `FREE_DESCRIPTOR_SET`, and `destroy_texture` never returned them, so
+after a few thousand uploads every allocation failed. The error was discarded
+with `let _ =`, so the upload silently left nothing at that address and the
+next bind fell back to white. Games re-download constantly (Unreal refreshes
+lightmaps every frame), so in-game this happened within seconds. Fixes: the
+pool allows freeing and `destroy_texture` frees both sets; a re-upload of the
+same address at the same size now overwrites the image in place instead of
+building a new one (guarded by a `used_frame` stamp so it never touches a
+texture already bound in the frame being recorded — earlier frames are
+complete, their fence is waited on at present); and a failed upload is logged
+instead of swallowed. Measured in the same save: texture misses per frame 275
+-> 0, uploads per frame 29-119 -> 3-18, upload time 4-55 ms -> 0.7-3.8 ms per
+frame, and 14-96 fps -> 102-145 fps. The `perf` line now also reports
+`uploads/frame`, `upload=<ms>/frame` and `texmiss/frame`.
+
 **Frame rate collapsed with resolution (~2 fps at 1600x1200, ~7 at
 800x600) — the frame-capture diagnostic was on for every frame.** The capture
 setting defaulted to `-1`, and negative values mean "every |n| frames", so with

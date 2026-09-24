@@ -85,15 +85,7 @@ fn glidevk_log(msg: &str) {
     }
 }
 
-use std::sync::atomic::{AtomicBool, Ordering};
-static LOG_TS: AtomicBool = AtomicBool::new(false);
-
-/// Log `msg` at most once (per `flag`), for tracing setup calls without spam.
-fn log_once(flag: &AtomicBool, msg: &str) {
-    if !flag.swap(true, Ordering::Relaxed) {
-        glidevk_log(msg);
-    }
-}
+use std::sync::atomic::Ordering;
 
 /// Log `msg` the first time this exact `key` is seen — for enumerating all the
 /// distinct render-state configurations a game uses without per-call spam.
@@ -168,6 +160,8 @@ static LAST_TEX_ADDR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 /// Distinct textured primitives logged so far by [`log_texcoords`], bounded by
 /// `TEXLOG_MAX` so an animating overlay can't flood the log.
 static TEXLOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Binds that found no downloaded texture, counted per `perf` window.
+static TEX_MISSES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Glide's texture-coordinate range on a texture's major axis (mirrors the
 /// shader's `GLIDE_ST_RANGE`).
 const GLIDE_ST_RANGE: f32 = 256.0;
@@ -471,9 +465,11 @@ fn apply_depth_mode(mode: DepthMode, tris: &mut [DrawVertex]) {
 /// Bind the texture selected by `grTexSource` for a draw (see
 /// `Context::bind_for_draw`), logging each freshly decoded palette variant.
 fn bind_draw_texture(ctx: &mut Context) {
+    let t0 = std::time::Instant::now();
     let Some(up) = ctx.bind_for_draw() else {
         return;
     };
+    perf_upload(t0.elapsed().as_nanos() as u64);
     let tex = &up.texture;
     let n = (tex.rgba.len() / 4).max(1) as u64;
     let avg = |c: usize| tex.rgba.chunks_exact(4).map(|p| p[c] as u64).sum::<u64>() / n;
@@ -511,6 +507,8 @@ fn bind_draw_texture(ctx: &mut Context) {
 struct Perf {
     draws: u64,
     tris: u64,
+    uploads: u64,
+    upload_ns: u64,
     submit_ns: u64,
     present_ns: u64,
     frames: u32,
@@ -519,12 +517,22 @@ struct Perf {
 static PERF: Mutex<Perf> = Mutex::new(Perf {
     draws: 0,
     tris: 0,
+    uploads: 0,
+    upload_ns: 0,
     submit_ns: 0,
     present_ns: 0,
     frames: 0,
     since: None,
 });
 const PERF_EVERY: u32 = 120;
+
+/// Record one texture decode+upload (`grTexDownload*`, or a palette variant).
+fn perf_upload(ns: u64) {
+    if let Ok(mut p) = PERF.lock() {
+        p.uploads += 1;
+        p.upload_ns += ns;
+    }
+}
 
 fn perf_draw(tris: u64, ns: u64) {
     if let Ok(mut p) = PERF.lock() {
@@ -548,16 +556,22 @@ fn perf_frame(present_ns: u64) {
         let secs = since.elapsed().as_secs_f64().max(1e-6);
         let f = p.frames as f64;
         glidevk_log(&format!(
-            "perf fps={:.1} draws/frame={:.0} tris/frame={:.0} submit={:.2}ms/frame present={:.2}ms/frame",
+            "perf fps={:.1} draws/frame={:.0} tris/frame={:.0} submit={:.2}ms/frame present={:.2}ms/frame \
+             uploads/frame={:.0} upload={:.2}ms/frame texmiss/frame={:.1}",
             f / secs,
             p.draws as f64 / f,
             p.tris as f64 / f,
             p.submit_ns as f64 / f / 1e6,
-            p.present_ns as f64 / f / 1e6
+            p.present_ns as f64 / f / 1e6,
+            p.uploads as f64 / f,
+            p.upload_ns as f64 / f / 1e6,
+            TEX_MISSES.swap(0, Ordering::Relaxed) as f64 / f
         ));
         *p = Perf {
             draws: 0,
             tris: 0,
+            uploads: 0,
+            upload_ns: 0,
             submit_ns: 0,
             present_ns: 0,
             frames: 0,
@@ -1203,6 +1217,7 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
     if info.is_null() {
         return;
     }
+    let t0 = std::time::Instant::now();
     let info = &*info;
     trace(&format!(
         "grTexDownload addr={start_address:#x} fmt={:#x} lod={} aspect={}",
@@ -1244,7 +1259,13 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
                 log_texture_content(start_address, info.format, w, h, &tex.rgba, src);
                 if !matches!(fmt, TexFormat::P8) {
                     if let Some(b) = ctx.backend.as_mut() {
-                        let _ = b.upload_texture(start_address as u64, w, h, &tex.rgba);
+                        // A failed upload leaves nothing at this address, so the
+                        // next bind falls back to white: never swallow it.
+                        if let Err(e) = b.upload_texture(start_address as u64, w, h, &tex.rgba) {
+                            glidevk_log(&format!(
+                                "grTexDownload: upload FAILED addr={start_address:#x} {w}x{h}: {e:?}"
+                            ));
+                        }
                     }
                 }
             }
@@ -1254,6 +1275,7 @@ unsafe fn download_texture(start_address: u32, info: *const GrTexInfo) {
             )),
         }
     });
+    perf_upload(t0.elapsed().as_nanos() as u64);
 }
 
 /// Log a decoded texture's average colour + alpha coverage (deduped by address),
@@ -1335,12 +1357,13 @@ pub extern "system" fn grTexSource(
     trace(&format!("grTexSource addr={start_address:#x}"));
     with_ctx(|ctx| {
         if !ctx.bind_texture(start_address) {
-            {
-                log_once(
-                    &LOG_TS,
-                    &format!("grTexSource addr={start_address:#x} -> NO texture (default white)"),
-                );
-            }
+            // Nothing downloaded at that address: the backend falls back to a
+            // 1x1 white texture, which reads on screen as an untextured surface.
+            TEX_MISSES.fetch_add(1, Ordering::Relaxed);
+            log_distinct(
+                9 << 40 | start_address as u64,
+                &format!("grTexSource addr={start_address:#x} -> NO texture (default white)"),
+            );
         }
     });
 }
