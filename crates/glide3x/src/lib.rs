@@ -490,8 +490,10 @@ fn to_triangle_list(mode: i32, v: &[DrawVertex]) -> Vec<DrawVertex> {
     let mut out = Vec::new();
     match mode {
         GR_TRIANGLES => {
-            for c in v.chunks_exact(3) {
-                out.extend_from_slice(c);
+            let (triangles, remainder) = v.as_chunks::<3>();
+            debug_assert!(remainder.is_empty());
+            for triangle in triangles {
+                out.extend_from_slice(triangle);
             }
         }
         GR_TRIANGLE_STRIP => {

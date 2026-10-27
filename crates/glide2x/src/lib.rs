@@ -690,7 +690,15 @@ fn bind_draw_texture(ctx: &mut Context) {
     let tex = &up.texture;
     if detail_log_enabled() {
         let n = (tex.rgba.len() / 4).max(1) as u64;
-        let avg = |c: usize| tex.rgba.chunks_exact(4).map(|p| p[c] as u64).sum::<u64>() / n;
+        let avg = |c: usize| {
+            tex.rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|p| p[c] as u64)
+                .sum::<u64>()
+                / n
+        };
         log_distinct(
             8 << 40 | (up.addr as u64) << 8 | avg(0),
             &format!(
@@ -1357,8 +1365,10 @@ fn write_ppm(path: &str, w: u32, h: u32, rgba: &[u8]) {
     if let Ok(mut f) = std::fs::File::create(path) {
         let _ = write!(f, "P6\n{w} {h}\n255\n");
         let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-        for px in rgba.chunks_exact(4) {
-            rgb.extend_from_slice(&px[..3]);
+        let (pixels, remainder) = rgba.as_chunks::<4>();
+        debug_assert!(remainder.is_empty());
+        for pixel in pixels {
+            rgb.extend_from_slice(&pixel[..3]);
         }
         let _ = f.write_all(&rgb);
     }
@@ -1812,12 +1822,14 @@ fn log_texture_content(addr: u32, format: u32, w: u32, h: u32, rgba: &[u8], raw:
     };
     let (mut r, mut gg, mut b, mut a, mut opaque) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let n = rgba.len() / 4;
-    for px in rgba.chunks_exact(4) {
-        r += px[0] as u64;
-        gg += px[1] as u64;
-        b += px[2] as u64;
-        a += px[3] as u64;
-        if px[3] >= 128 {
+    let (pixels, remainder) = rgba.as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
+    for pixel in pixels {
+        r += pixel[0] as u64;
+        gg += pixel[1] as u64;
+        b += pixel[2] as u64;
+        a += pixel[3] as u64;
+        if pixel[3] >= 128 {
             opaque += 1;
         }
     }
