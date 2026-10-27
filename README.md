@@ -95,6 +95,21 @@ cargo +nightly build -Z build-std=std,panic_abort -p glide3x --release --target 
 Replace `glide3x` with `glide2x` to build that DLL. The target must remain
 installed because `build-std` does not provide Rust's Windows startup objects.
 
+### GitHub Actions DLL artifacts and releases
+
+The [Windows DLLs workflow](.github/workflows/windows-dlls.yml) runs the native
+tests and Clippy, cross-builds both shipping PE32 DLLs with the pinned nightly
+`build-std` workaround, verifies that they are i686 DLLs with the expected
+exports, and uploads:
+
+- `glide2x.dll`
+- `glide3x.dll`
+- `SHA256SUMS`
+
+Every push, pull request, and manual workflow run gets a `glidevk-i686-windows`
+workflow artifact. Pushing a tag beginning with `v` also attaches those same
+three files to the corresponding GitHub Release.
+
 Exports are forced undecorated via `#[export_name]` and mirrored in
 [`crates/glide3x/glide3x.def`](crates/glide3x/glide3x.def) for the MinGW linker.
 Vulkan is reached through the in-prefix `vulkan-1.dll` → `winevulkan`, exactly as
