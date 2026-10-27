@@ -267,12 +267,16 @@ equivalent itself (`glidevk-core::win32`): `grSstWinOpen` calls
 the game window a borderless popup of that size at the origin; `grSstWinClose`
 restores the desktop mode. Wine emulates the mode switch by scaling the
 fullscreen window and its mouse input to the monitor, which is what makes
-"fullscreen" and in-game resolution changes work. The swapchain now follows
-the window's surface extent every frame instead of waiting for an
-out-of-date error Wine does not always raise. `GLIDEVK_WINDOWED=1` keeps the
-desktop mode and adds a draggable caption to the game window while preserving
-its client size (the harness runners set it). The logical Glide resolution can
-still differ from that client size; the renderer scales to the client area.
+"fullscreen" and in-game resolution changes work. If Wine rejects a legacy mode
+(macOS commonly returns `BADMODE` for 1600x1200), GlideVK still makes the game
+window a borderless window covering its current monitor; the rejected mode
+remains the logical Glide coordinate space. The swapchain now follows the
+window's surface extent every frame instead of waiting for an out-of-date error
+Wine does not always raise. `GLIDEVK_WINDOWED=1` keeps the desktop mode and
+adds a draggable caption to the game window while preserving its client size;
+`GLIDEVK_WINDOWED=0` or leaving it unset selects the fullscreen path. The
+logical Glide resolution can still differ from that client size; the renderer
+scales to the client area.
 Note that toggling *off* fullscreen in the game still means Unreal's software
 renderer: GlideDrv is fullscreen-only by design, as on real hardware.
 

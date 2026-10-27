@@ -40,7 +40,14 @@ static WINDOWED_RESTORE: Mutex<Option<glidevk_core::win32::WindowedWindowState>>
 fn windowed() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("GLIDEVK_WINDOWED").is_some())
+    *ON.get_or_init(|| {
+        std::env::var_os("GLIDEVK_WINDOWED")
+            .map(|value| {
+                let value = value.to_string_lossy();
+                !value.is_empty() && value != "0"
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Glide is fullscreen-only: switch the display to the requested mode like a
@@ -104,12 +111,24 @@ fn enter_display_mode(hwnd: usize, w: u32, h: u32) {
     }
     match glidevk_core::win32::set_display_mode(w, h) {
         Ok(()) => {
-            glidevk_core::win32::make_fullscreen_window(hwnd as isize, w, h);
-            glidevk_log(&format!("display mode {w}x{h} set, window sized to match"));
+            let actual = glidevk_core::win32::make_fullscreen_window(hwnd as isize, w, h);
+            glidevk_log(&format!(
+                "display mode {w}x{h} set, fullscreen window={actual:?}"
+            ));
         }
-        Err(code) => glidevk_log(&format!(
-            "display mode {w}x{h} FAILED (DISP_CHANGE {code}); staying windowed"
-        )),
+        Err(code) => {
+            // Wine frequently rejects legacy modes such as 1600x1200 on macOS
+            // (DISP_CHANGE_BADMODE). The game may still have its initial
+            // 640x480 window, so retaining it produces a black square in the
+            // upper-left corner. Cover the current monitor instead and keep the
+            // requested mode as Glide's logical coordinate space; Vulkan scales
+            // that space to the surface.
+            let actual = glidevk_core::win32::make_fullscreen_window(hwnd as isize, w, h);
+            glidevk_log(&format!(
+                "display mode {w}x{h} FAILED (DISP_CHANGE {code}); \
+                 borderless monitor fallback window={actual:?}"
+            ));
+        }
     }
 }
 

@@ -157,14 +157,41 @@ fn windowed_style(style: u32) -> u32 {
     (style & !WS_POPUP) | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Rect {
     left: i32,
     top: i32,
     right: i32,
     bottom: i32,
+}
+
+/// Choose a borderless fullscreen window's position and size.
+///
+/// A valid monitor rectangle takes precedence: when Wine rejects the requested
+/// legacy video mode, covering that monitor still gives the game a fullscreen
+/// surface. The requested mode remains the backend's logical coordinate space.
+#[cfg(any(windows, test))]
+fn fullscreen_bounds(monitor: Option<Rect>, requested: (u32, u32)) -> Rect {
+    let Some(monitor) = monitor else {
+        return Rect {
+            left: 0,
+            top: 0,
+            right: requested.0 as i32,
+            bottom: requested.1 as i32,
+        };
+    };
+    if monitor.right > monitor.left && monitor.bottom > monitor.top {
+        return monitor;
+    }
+
+    Rect {
+        left: monitor.left,
+        top: monitor.top,
+        right: monitor.left + requested.0 as i32,
+        bottom: monitor.top + requested.1 as i32,
+    }
 }
 
 #[cfg(windows)]
@@ -490,10 +517,23 @@ pub fn hide_glide_window(hwnd: isize) {
 /// treat it as fullscreen and scale it. Games do this themselves on real
 /// hardware only if their engine bothers (Deus Ex does not).
 #[cfg(windows)]
-pub fn make_fullscreen_window(hwnd: isize, width: u32, height: u32) {
+pub fn make_fullscreen_window(hwnd: isize, width: u32, height: u32) -> Option<(u32, u32)> {
     if hwnd == 0 {
-        return;
+        return None;
     }
+    let mut info = MonitorInfo {
+        size: core::mem::size_of::<MonitorInfo>() as u32,
+        monitor: Rect::default(),
+        work: Rect::default(),
+        flags: 0,
+    };
+    let monitor = unsafe { MonitorFromWindow(hwnd, 2) }; // MONITOR_DEFAULTTONEAREST
+    let monitor_rect = if monitor != 0 && unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
+        Some(info.monitor)
+    } else {
+        None
+    };
+    let bounds = fullscreen_bounds(monitor_rect, (width, height));
     let style = (WS_POPUP | WS_VISIBLE) as i32;
     // SAFETY: `hwnd` is the game's window handle passed to grSstWinOpen.
     unsafe {
@@ -504,13 +544,17 @@ pub fn make_fullscreen_window(hwnd: isize, width: u32, height: u32) {
         SetWindowPos(
             hwnd,
             HWND_TOP,
-            0,
-            0,
-            width as i32,
-            height as i32,
+            bounds.left,
+            bounds.top,
+            bounds.right - bounds.left,
+            bounds.bottom - bounds.top,
             SWP_FRAMECHANGED | SWP_SHOWWINDOW,
         );
     }
+    Some((
+        (bounds.right - bounds.left).max(1) as u32,
+        (bounds.bottom - bounds.top).max(1) as u32,
+    ))
 }
 
 /// Switch the primary display to `width`x`height` for the calling process
@@ -579,6 +623,45 @@ mod tests {
         assert_eq!(
             style & (WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX),
             WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+        );
+    }
+
+    #[test]
+    fn fullscreen_bounds_prefer_a_valid_monitor() {
+        let monitor = Rect {
+            left: 2560,
+            top: 144,
+            right: 6016,
+            bottom: 2444,
+        };
+        assert_eq!(fullscreen_bounds(Some(monitor), (1600, 1200)), monitor);
+
+        // A malformed monitor result must not collapse the game to 1x1; retain
+        // its origin but use the requested Glide mode as the fallback size.
+        let invalid = Rect {
+            left: 100,
+            top: 50,
+            right: 100,
+            bottom: 50,
+        };
+        assert_eq!(
+            fullscreen_bounds(Some(invalid), (1600, 1200)),
+            Rect {
+                left: 100,
+                top: 50,
+                right: 1700,
+                bottom: 1250,
+            }
+        );
+
+        assert_eq!(
+            fullscreen_bounds(None, (1600, 1200)),
+            Rect {
+                left: 0,
+                top: 0,
+                right: 1600,
+                bottom: 1200,
+            }
         );
     }
 }
