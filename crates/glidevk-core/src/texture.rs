@@ -284,9 +284,11 @@ fn as_u16_slice(src: &[u8], texels: usize) -> Result<Vec<u16>, DecodeError> {
     if src.len() < texels * 2 {
         return Err(DecodeError::ShortBuffer);
     }
-    Ok(src[..texels * 2]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+    let (chunks, remainder) = src[..texels * 2].as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    Ok(chunks
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect())
 }
 
